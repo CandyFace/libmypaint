@@ -25,58 +25,26 @@ License: ISC, see [COPYING](./COPYING) for details.
 * For `--enable-gegl` (GIMP *does not* require this):
   - [GEGL + BABL](http://gegl.org/)
 
-### Install dependencies (Debian and derivatives)
-
 On recent Debian-like systems, you can type the following
 to get started with a standard configuration:
 
-    $ sudo apt install -y build-essential
-    $ sudo apt install -y libjson-c-dev libgirepository1.0-dev libglib2.0-dev
-
-When building from git:
-
-    $ sudo apt install -y python2.7 autotools-dev intltool gettext libtool
-    
-You might also try using your package manager:
-
-    $ sudo apt build-dep mypaint # will get additional deps for MyPaint (GUI)
-    $ sudo apt build-dep libmypaint  # may not exist; included in mypaint
-
-### Install dependencies (Red Hat and derivatives)
-
-The following works on a minimal CentOS 7 installation:
-
-    $ sudo yum install -y gcc gobject-introspection-devel json-c-devel glib2-devel
-
-When building from git, you'll want to add:
-
-    $ sudo yum install -y git python autoconf intltool gettext libtool
-    
-You might also try your package manager:
-    
-    $ sudo yum builddep libmypaint
+    $ sudo apt install build-essential
+    $ sudo apt install libjson-c-dev libgirepository1.0-dev libglib2.0-dev
+    $ sudo apt install python2 autotools intltool gettext   # Building from git
 
 ## Build and install
-
-MyPaint and libmypaint benefit dramatically from autovectorization and other compiler optimizations.
-You may want to set your CFLAGS before compiling (for gcc):
-
-    $ export CFLAGS='-Ofast -ftree-vectorize -fopt-info-vec-optimized -march=native -mtune=native -funsafe-math-optimizations -funsafe-loop-optimizations'
 
 The traditional setup works just fine.
 
     $ ./autogen.sh    # Only needed when building from git.
     $ ./configure
-    $ sudo make install
-    $ sudo ldconfig
+    $ make install
 
 ### Maintainer mode
 
 We don't ship a `configure` script in our git repository. If you're
 building from git, you have to kickstart the build environment with:
 
-    $ git clone https://github.com/mypaint/libmypaint.git
-    $ cd libmypaint
     $ ./autogen.sh
 
 This script generates `configure` from `configure.ac`, after running a
@@ -110,35 +78,9 @@ This runs all the unit tests.
 
 ### Install
 
-    $ sudo make install
+    $ make install
 
 Uninstall libmypaint with `make uninstall`.
-
-### Check availability
-
-Make sure that pkg-config can see libmypaint before trying to build with it.
-
-    $ pkg-config --list-all | grep -i mypaint
-
-If it's not found, you'll need to add the relevant pkgconfig directory to
-the `pkg-config` search path. For example, on CentOS, with a default install:
-
-    $ sudo sh -c "echo 'PKG_CONFIG_PATH=/usr/local/lib/pkgconfig' >>/etc/environment"
-
-Make sure ldconfig can see libmypaint as well
-
-    $ sudo ldconfig -p |grep -i libmypaint
-
-If it's not found, you'll need to add the relevant lib directory to
-the LD_LIBRARY_PATH:
-    
-    $ export LD_LIBRARY_PATH=/usr/local/lib
-    $ sudo sh -c "echo 'LD_LIBRARY_PATH=/usr/local/lib' >>/etc/environment
-
-Alternatively, you may want to enable /usr/local for libraries.  Arch and Redhat derivatives:
-
-    $ sudo sh -c "echo '/usr/local/lib' > /etc/ld.so.conf.d/usrlocal.conf"
-    $ sudo ldconfig
 
 ## Contributing
 

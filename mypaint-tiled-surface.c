@@ -98,7 +98,7 @@ mypaint_tiled_surface_end_atomic(MyPaintTiledSurface *self, MyPaintRectangle *ro
  * mypaint_tiled_surface_tile_request_start:
  *
  * Fetch a tile out from the underlying tile store.
- * When successful, request->data will be set to point to the fetched tile.
+ * When successfull, request->data will be set to point to the fetched tile.
  * Consumers must *always* call mypaint_tiled_surface_tile_request_end() with the same
  * request to complete the transaction.
  */
@@ -127,23 +127,14 @@ void mypaint_tiled_surface_tile_request_end(MyPaintTiledSurface *self, MyPaintTi
  * mypaint_tiled_surface_set_symmetry_state:
  * @active: TRUE to enable, FALSE to disable.
  * @center_x: X axis to mirror events across.
- * @center_y: Y axis to mirror events across.
- * @symmetry_type: Symmetry type to activate.
- * @rot_symmetry_lines: Number of rotational symmetry lines.
  *
  * Enable/Disable symmetric brush painting across an X axis.
  */
 void
-mypaint_tiled_surface_set_symmetry_state(MyPaintTiledSurface *self, gboolean active,
-                                         float center_x, float center_y,
-                                         MyPaintSymmetryType symmetry_type,
-                                         int rot_symmetry_lines)
+mypaint_tiled_surface_set_symmetry_state(MyPaintTiledSurface *self, gboolean active, float center_x)
 {
     self->surface_do_symmetry = active;
     self->surface_center_x = center_x;
-    self->surface_center_y = center_y;
-    self->symmetry_type = symmetry_type;
-    self->rot_symmetry_lines = MAX(2, rot_symmetry_lines);
 }
 
 /**
@@ -452,55 +443,26 @@ process_op(uint16_t *rgba_p, uint16_t *mask,
                     );
 
     // second, we use the mask to stamp a dab for each activated blend mode
-    if (op->paint < 1.0) {
-      if (op->normal) {
-        if (op->color_a == 1.0) {
-          draw_dab_pixels_BlendMode_Normal(mask, rgba_p,
-                                           op->color_r, op->color_g, op->color_b, op->normal*op->opaque*(1 - op->paint)*(1<<15));
-        } else {
-          // normal case for brushes that use smudging (eg. watercolor)
-          draw_dab_pixels_BlendMode_Normal_and_Eraser(mask, rgba_p,
-                                                      op->color_r, op->color_g, op->color_b, op->color_a*(1<<15),
-                                                      op->normal*op->opaque*(1 - op->paint)*(1<<15));
-        }
-      }
 
-      if (op->lock_alpha) {
-        draw_dab_pixels_BlendMode_LockAlpha(mask, rgba_p,
-                                            op->color_r, op->color_g, op->color_b,
-                                            op->lock_alpha*op->opaque*(1 - op->colorize)*(1 - op->posterize)*(1 - op->paint)*(1<<15));
+    if (op->normal) {
+      if (op->color_a == 1.0) {
+        draw_dab_pixels_BlendMode_Normal(mask, rgba_p,
+                                         op->color_r, op->color_g, op->color_b, op->normal*op->opaque*(1<<15));
+      } else {
+        // normal case for brushes that use smudging (eg. watercolor)
+        draw_dab_pixels_BlendMode_Normal_and_Eraser(mask, rgba_p,
+                                                    op->color_r, op->color_g, op->color_b, op->color_a*(1<<15), op->normal*op->opaque*(1<<15));
       }
     }
-    
-    if (op->paint > 0.0) {
-      if (op->normal) {
-        if (op->color_a == 1.0) {
-          draw_dab_pixels_BlendMode_Normal_Paint(mask, rgba_p,
-                                           op->color_r, op->color_g, op->color_b, op->normal*op->opaque*op->paint*(1<<15));
-        } else {
-          // normal case for brushes that use smudging (eg. watercolor)
-          draw_dab_pixels_BlendMode_Normal_and_Eraser_Paint(mask, rgba_p,
-                                                      op->color_r, op->color_g, op->color_b, op->color_a*(1<<15),
-                                                      op->normal*op->opaque*op->paint*(1<<15));
-        }
-      }
 
-      if (op->lock_alpha) {
-        draw_dab_pixels_BlendMode_LockAlpha_Paint(mask, rgba_p,
-                                            op->color_r, op->color_g, op->color_b,
-                                            op->lock_alpha*op->opaque*(1 - op->colorize)*(1 - op->posterize)*op->paint*(1<<15));
-      }
+    if (op->lock_alpha) {
+      draw_dab_pixels_BlendMode_LockAlpha(mask, rgba_p,
+                                          op->color_r, op->color_g, op->color_b, op->lock_alpha*op->opaque*(1<<15));
     }
-    
     if (op->colorize) {
       draw_dab_pixels_BlendMode_Color(mask, rgba_p,
                                       op->color_r, op->color_g, op->color_b,
                                       op->colorize*op->opaque*(1<<15));
-    }
-    if (op->posterize) {
-      draw_dab_pixels_BlendMode_Posterize(mask, rgba_p,
-                                      op->posterize*op->opaque*(1<<15),
-                                      op->posterize_num);
     }
 }
 
@@ -560,10 +522,7 @@ gboolean draw_dab_internal (MyPaintTiledSurface *self, float x, float y,
                float color_a,
                float aspect_ratio, float angle,
                float lock_alpha,
-               float colorize,
-               float posterize,
-               float posterize_num,
-               float paint
+               float colorize
                )
 
 {
@@ -579,9 +538,6 @@ gboolean draw_dab_internal (MyPaintTiledSurface *self, float x, float y,
     op->hardness = CLAMP(hardness, 0.0f, 1.0f);
     op->lock_alpha = CLAMP(lock_alpha, 0.0f, 1.0f);
     op->colorize = CLAMP(colorize, 0.0f, 1.0f);
-    op->posterize = CLAMP(posterize, 0.0f, 1.0f);
-    op->posterize_num= CLAMP(ROUND(posterize_num * 100.0), 1, 128);
-    op->paint = CLAMP(paint, 0.0f, 1.0f);
     if (op->radius < 0.1f) return FALSE; // don't bother with dabs smaller than 0.1 pixel
     if (op->hardness == 0.0f) return FALSE; // infintly small center point, fully transparent outside
     if (op->opaque == 0.0f) return FALSE;
@@ -601,7 +557,6 @@ gboolean draw_dab_internal (MyPaintTiledSurface *self, float x, float y,
 
     op->normal *= 1.0f-op->lock_alpha;
     op->normal *= 1.0f-op->colorize;
-    op->normal *= 1.0f-op->posterize;
 
     if (op->aspect_ratio<1.0f) op->aspect_ratio=1.0f;
 
@@ -635,10 +590,7 @@ int draw_dab (MyPaintSurface *surface, float x, float y,
                float color_a,
                float aspect_ratio, float angle,
                float lock_alpha,
-               float colorize,
-               float posterize,
-               float posterize_num,
-               float paint)
+               float colorize)
 {
   MyPaintTiledSurface *self = (MyPaintTiledSurface *)surface;
 
@@ -647,126 +599,19 @@ int draw_dab (MyPaintSurface *surface, float x, float y,
   // Normal pass
   if (draw_dab_internal(self, x, y, radius, color_r, color_g, color_b,
                         opaque, hardness, color_a, aspect_ratio, angle,
-                        lock_alpha, colorize, posterize, posterize_num, paint)) {
+                        lock_alpha, colorize)) {
       surface_modified = TRUE;
   }
 
   // Symmetry pass
   if(self->surface_do_symmetry) {
-    const float dist_x = (self->surface_center_x - x);
-    const float dist_y = (self->surface_center_y - y);
-    const float symm_x = self->surface_center_x + dist_x;
-    const float symm_y = self->surface_center_y + dist_y;
+    const float symm_x = self->surface_center_x + (self->surface_center_x - x);
 
-    const float dab_dist = sqrt(dist_x * dist_x + dist_y * dist_y);
-    const float rot_width = 360.0 / ((float) self->rot_symmetry_lines);
-    const float dab_angle_offset = atan2(-dist_y, -dist_x) / (2 * M_PI) * 360.0;
-
-    int dab_count = 1;
-    int sub_dab_count = 0;
-
-      switch(self->symmetry_type) {
-          case MYPAINT_SYMMETRY_TYPE_VERTICAL:
-            if (draw_dab_internal(self, symm_x, y, radius, color_r, color_g, color_b,
-                                   opaque, hardness, color_a, aspect_ratio, -angle,
-                                   lock_alpha, colorize, posterize, posterize_num, paint)) {
-                surface_modified = TRUE;
-            }
-            break;
-
-          case MYPAINT_SYMMETRY_TYPE_HORIZONTAL:
-            if (draw_dab_internal(self, x, symm_y, radius, color_r, color_g, color_b,
-                                   opaque, hardness, color_a, aspect_ratio, angle + 180.0,
-                                   lock_alpha, colorize, posterize, posterize_num, paint)) {
-                surface_modified = TRUE;
-            }
-            break;
-
-          case MYPAINT_SYMMETRY_TYPE_VERTHORZ:
-            // reflect vertically
-            if (draw_dab_internal(self, symm_x, y, radius, color_r, color_g, color_b,
-                                   opaque, hardness, color_a, aspect_ratio, -angle,
-                                   lock_alpha, colorize, posterize, posterize_num, paint)) {
-                dab_count++;
-            }
-            // reflect horizontally
-            if (draw_dab_internal(self, x, symm_y, radius, color_r, color_g, color_b,
-                                   opaque, hardness, color_a, aspect_ratio, angle + 180.0,
-                                   lock_alpha, colorize, posterize, posterize_num, paint)) {
-                dab_count++;
-            }
-            // reflect horizontally and vertically
-            if (draw_dab_internal(self, symm_x, symm_y, radius, color_r, color_g, color_b,
-                                   opaque, hardness, color_a, aspect_ratio, -angle - 180.0,
-                                   lock_alpha, colorize, posterize, posterize_num, paint)) {
-                dab_count++;
-            }
-            if (dab_count == 4) {
-                surface_modified = TRUE;
-            }
-            break;
-          case MYPAINT_SYMMETRY_TYPE_SNOWFLAKE: {
-                gboolean failed_subdabs = FALSE;
-
-                // draw self->rot_symmetry_lines snowflake dabs
-                // because the snowflaked version of the initial dab
-                // was not done through carrying out the initial pass
-                for (sub_dab_count = 0; sub_dab_count < self->rot_symmetry_lines; sub_dab_count++) {
-                    // calculate the offset from rotational symmetry
-                    const float symmetry_angle_offset = ((float)sub_dab_count) * rot_width;
-
-                    // subtract the angle offset since we're progressing clockwise
-                    const float cur_angle = symmetry_angle_offset - dab_angle_offset;
-
-                    // progress through the rotation angle offsets clockwise
-                    // to reflect the dab relative to itself
-                    const float rot_x = self->surface_center_x - dab_dist*cos(cur_angle / 180.0 * M_PI);
-                    const float rot_y = self->surface_center_y - dab_dist*sin(cur_angle / 180.0 * M_PI);
-
-                    if (!draw_dab_internal(self, rot_x, rot_y, radius, color_r, color_g, color_b,
-                                           opaque, hardness, color_a,
-                                           aspect_ratio, -angle + symmetry_angle_offset,
-                                           lock_alpha, colorize, posterize, posterize_num, paint)) {
-                        failed_subdabs = TRUE;
-                        break;
-                    }
-                }
-
-                // do not bother falling to rotational if the snowflaked dabs failed
-                if (failed_subdabs) {
-                    break;
-                }
-                // if it succeeded, fallthrough to rotational to finish the process
-            }
-
-          case MYPAINT_SYMMETRY_TYPE_ROTATIONAL: {
-                // draw self-rot_symmetry_lines rotational dabs
-                // since initial pass handles the first dab
-                for (dab_count = 1; dab_count < self->rot_symmetry_lines; dab_count++)
-                {
-                    // calculate the offset from rotational symmetry
-                    const float symmetry_angle_offset = ((float)dab_count) * rot_width;
-
-                    // add the angle initial dab is from center point
-                    const float cur_angle = symmetry_angle_offset + dab_angle_offset;
-
-                    // progress through the rotation cangle offsets counterclockwise
-                    const float rot_x = self->surface_center_x + dab_dist*cos(cur_angle / 180.0 * M_PI);
-                    const float rot_y = self->surface_center_y + dab_dist*sin(cur_angle / 180.0 * M_PI);
-
-                    if (!draw_dab_internal(self, rot_x, rot_y, radius, color_r, color_g, color_b,
-                                           opaque, hardness, color_a, aspect_ratio,
-                                           angle + symmetry_angle_offset,
-                                           lock_alpha, colorize, posterize, posterize_num, paint)) {
-                        break;
-                    }
-                }
-                if (dab_count == self->rot_symmetry_lines) {
-                    surface_modified = TRUE;
-                }
-                break;
-            }
-      }
+    if (draw_dab_internal(self, symm_x, y, radius, color_r, color_g, color_b,
+                           opaque, hardness, color_a, aspect_ratio, -angle,
+                           lock_alpha, colorize)) {
+        surface_modified = TRUE;
+    }
 
   }
 
@@ -776,8 +621,7 @@ int draw_dab (MyPaintSurface *surface, float x, float y,
 
 void get_color (MyPaintSurface *surface, float x, float y,
                   float radius,
-                  float * color_r, float * color_g, float * color_b, float * color_a,
-                  float paint
+                  float * color_r, float * color_g, float * color_b, float * color_a
                   )
 {
     MyPaintTiledSurface *self = (MyPaintTiledSurface *)surface;
@@ -840,7 +684,7 @@ void get_color (MyPaintSurface *surface, float x, float y,
         #pragma omp critical
         {
         get_color_pixels_accumulate (mask, rgba_p,
-                                     &sum_weight, &sum_r, &sum_g, &sum_b, &sum_a, paint);
+                                     &sum_weight, &sum_r, &sum_g, &sum_b, &sum_a);
         }
 
         mypaint_tiled_surface_tile_request_end(self, &request_data);
@@ -849,12 +693,16 @@ void get_color (MyPaintSurface *surface, float x, float y,
 
     assert(sum_weight > 0.0f);
     sum_a /= sum_weight;
+    sum_r /= sum_weight;
+    sum_g /= sum_weight;
+    sum_b /= sum_weight;
+
     *color_a = sum_a;
     // now un-premultiply the alpha
     if (sum_a > 0.0f) {
-      *color_r = sum_r;
-      *color_g = sum_g;
-      *color_b = sum_b;
+      *color_r = sum_r / sum_a;
+      *color_g = sum_g / sum_a;
+      *color_b = sum_b / sum_a;
     } else {
       // it is all transparent, so don't care about the colors
       // (let's make them ugly so bugs will be visible)
@@ -869,7 +717,6 @@ void get_color (MyPaintSurface *surface, float x, float y,
     *color_b = CLAMP(*color_b, 0.0f, 1.0f);
     *color_a = CLAMP(*color_a, 0.0f, 1.0f);
 }
-
 
 /**
  * mypaint_tiled_surface_init: (skip)
@@ -899,10 +746,7 @@ mypaint_tiled_surface_init(MyPaintTiledSurface *self,
     self->dirty_bbox.width = 0;
     self->dirty_bbox.height = 0;
     self->surface_do_symmetry = FALSE;
-    self->symmetry_type = MYPAINT_SYMMETRY_TYPE_VERTICAL;
     self->surface_center_x = 0.0f;
-    self->surface_center_y = 0.0f;
-    self->rot_symmetry_lines = 2;
     self->operation_queue = operation_queue_new();
 }
 

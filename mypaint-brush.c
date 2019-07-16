@@ -34,7 +34,12 @@
 #include "helpers.h"
 #include "rng-double.h"
 
+#ifdef HAVE_JSON_C
+// Allow the C99 define from json.h
+#undef TRUE
+#undef FALSE
 #include <json.h>
+#endif // HAVE_JSON_C
 
 #ifdef _MSC_VER
 #if _MSC_VER < 1700     // Visual Studio 2012 and later has isfinite and roundf
@@ -50,9 +55,6 @@
 
 #define ACTUAL_RADIUS_MIN 0.2
 #define ACTUAL_RADIUS_MAX 1000 // safety guard against radius like 1e20 and against rendering overload with unexpected brush dynamics
-
-//array for smudge states, which allow much higher more variety and "memory" of the brush
-float smudge_buckets[256][9] = {{0.0f}};
 
 /* The Brush class stores two things:
    b) settings: constant during a stroke (eg. size, spacing, dynamics, color selected by the user)
@@ -83,11 +85,6 @@ struct MyPaintBrush {
 
     // the states (get_state, set_state, reset) that change during a stroke
     float states[MYPAINT_BRUSH_STATES_COUNT];
-    double random_input;
-    float skip;
-    float skip_last_x;
-    float skip_last_y;
-    float skipped_dtime;
     RngDouble * rng;
 
     // Those mappings describe how to calculate the current value for each setting.
@@ -105,7 +102,9 @@ struct MyPaintBrush {
     float speed_mapping_q[2];
 
     gboolean reset_requested;
+#ifdef HAVE_JSON_C
     json_object *brush_json;
+#endif
     int refcount;
 };
 
@@ -131,11 +130,6 @@ mypaint_brush_new(void)
       self->settings[i] = mypaint_mapping_new(MYPAINT_BRUSH_INPUTS_COUNT);
     }
     self->rng = rng_double_new(1000);
-    self->random_input = 0;
-    self->skip = 0;
-    self->skip_last_x = 0;
-    self->skip_last_y = 0;
-    self->skipped_dtime = 0;
     self->print_inputs = FALSE;
 
     for (i=0; i<MYPAINT_BRUSH_STATES_COUNT; i++) {
@@ -147,7 +141,9 @@ mypaint_brush_new(void)
 
     self->reset_requested = TRUE;
 
+#ifdef HAVE_JSON_C
     self->brush_json = json_object_new_object();
+#endif
 
     return self;
 }
@@ -161,9 +157,11 @@ brush_free(MyPaintBrush *self)
     rng_double_free (self->rng);
     self->rng = NULL;
 
+#ifdef HAVE_JSON_C
     if (self->brush_json) {
         json_object_put(self->brush_json);
     }
+#endif
 
     free(self);
 }
@@ -365,6 +363,27 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
     self->states[i] = value;
 }
 
+
+// Returns the smallest angular difference (counterclockwise or clockwise) a to b, in degrees.
+// Clockwise is positive.
+static inline float
+smallest_angular_difference(float a, float b)
+{
+    float d_cw, d_ccw;
+    a = fmodf(a, 360.0);
+    b = fmodf(b, 360.0);
+    if (a > b) {
+        d_cw = a - b;
+        d_ccw = b + 360.0 - a;
+    }
+    else {
+        d_cw = a + 360.0 - b;
+        d_ccw = b - a;
+    }
+    return (d_cw < d_ccw) ? -d_cw : d_ccw;
+}
+
+
   // returns the fraction still left after t seconds
   float exp_decay (float T_const, float t)
   {
@@ -383,13 +402,13 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
     // precalculate stuff that does not change dynamically
 
     // Precalculate how the physical speed will be mapped to the speed input value.
-    // The formula for this mapping is:
+    // The forumla for this mapping is:
     //
     // y = log(gamma+x)*m + q;
     //
     // x: the physical speed (pixels per basic dab radius)
     // y: the speed input that will be reported
-    // gamma: parameter set by the user (small means a logarithmic mapping, big linear)
+    // gamma: parameter set by ths user (small means a logarithmic mapping, big linear)
     // m, q: parameters to scale and translate the curve
     //
     // The code below calculates m and q given gamma and two hardcoded constraints.
@@ -425,16 +444,10 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
   // mappings in critical places or extremely few events per second.
   //
   // note: parameters are is dx/ddab, ..., dtime/ddab (dab is the number, 5.0 = 5th dab)
-  void update_states_and_setting_values (MyPaintBrush *self, float step_ddab, float step_dx, float step_dy, float step_dpressure, float step_declination, float step_ascension, float step_dtime, float step_viewzoom, float step_viewrotation, float step_declinationx, float step_declinationy, float step_barrel_rotation)
+  void update_states_and_setting_values (MyPaintBrush *self, float step_ddab, float step_dx, float step_dy, float step_dpressure, float step_declination, float step_ascension, float step_dtime)
   {
     float pressure;
     float inputs[MYPAINT_BRUSH_INPUTS_COUNT];
-    float viewzoom;
-    float viewrotation;
-    float gridmap_scale;
-    float gridmap_scale_x;
-    float gridmap_scale_y;
-    float barrel_rotation;
 
     if (step_dtime < 0.0) {
       printf("Time is running backwards!\n");
@@ -447,44 +460,11 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
     self->states[MYPAINT_BRUSH_STATE_X]        += step_dx;
     self->states[MYPAINT_BRUSH_STATE_Y]        += step_dy;
     self->states[MYPAINT_BRUSH_STATE_PRESSURE] += step_dpressure;
-    
-    self->states[MYPAINT_BRUSH_STATE_DABS_PER_BASIC_RADIUS] = self->settings_value[MYPAINT_BRUSH_SETTING_DABS_PER_BASIC_RADIUS];
-    self->states[MYPAINT_BRUSH_STATE_DABS_PER_ACTUAL_RADIUS] = self->settings_value[MYPAINT_BRUSH_SETTING_DABS_PER_ACTUAL_RADIUS];
-    self->states[MYPAINT_BRUSH_STATE_DABS_PER_SECOND] = self->settings_value[MYPAINT_BRUSH_SETTING_DABS_PER_SECOND];
-    
 
     self->states[MYPAINT_BRUSH_STATE_DECLINATION] += step_declination;
-    self->states[MYPAINT_BRUSH_STATE_DECLINATIONX] += step_declinationx;
-    self->states[MYPAINT_BRUSH_STATE_DECLINATIONY] += step_declinationy;
     self->states[MYPAINT_BRUSH_STATE_ASCENSION] += step_ascension;
-    
-    self->states[MYPAINT_BRUSH_STATE_VIEWZOOM] = step_viewzoom;
-    self->states[MYPAINT_BRUSH_STATE_VIEWROTATION] = mod_arith((step_viewrotation * 180.0 / M_PI) + 180.0, 360.0) -180.0;
-    gridmap_scale = expf(self->settings_value[MYPAINT_BRUSH_SETTING_GRIDMAP_SCALE]);
-    gridmap_scale_x = self->settings_value[MYPAINT_BRUSH_SETTING_GRIDMAP_SCALE_X];
-    gridmap_scale_y = self->settings_value[MYPAINT_BRUSH_SETTING_GRIDMAP_SCALE_Y];
-    self->states[MYPAINT_BRUSH_STATE_GRIDMAP_X] = mod_arith(fabsf(self->states[MYPAINT_BRUSH_STATE_ACTUAL_X] * gridmap_scale_x), (gridmap_scale * 256.0)) / (gridmap_scale * 256.0) * 256.0;
-    self->states[MYPAINT_BRUSH_STATE_GRIDMAP_Y] = mod_arith(fabsf(self->states[MYPAINT_BRUSH_STATE_ACTUAL_Y] * gridmap_scale_y), (gridmap_scale * 256.0)) / (gridmap_scale * 256.0) * 256.0;
-    
-    if (self->states[MYPAINT_BRUSH_STATE_ACTUAL_X] < 0.0) {
-      self->states[MYPAINT_BRUSH_STATE_GRIDMAP_X] = 256.0 - self->states[MYPAINT_BRUSH_STATE_GRIDMAP_X];
-    }
-
-    if (self->states[MYPAINT_BRUSH_STATE_ACTUAL_Y] < 0.0) {
-      self->states[MYPAINT_BRUSH_STATE_GRIDMAP_Y] = 256.0 - self->states[MYPAINT_BRUSH_STATE_GRIDMAP_Y];
-    }
 
     float base_radius = expf(mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_RADIUS_LOGARITHMIC]));
-    self->states[MYPAINT_BRUSH_STATE_BARREL_ROTATION] += step_barrel_rotation;
-
-    
-    //first iteration is zero, set to 1, then flip to -1, back and forth
-    //useful for Anti-Art's mirrored offset but could be useful elsewhere
-    if (self->states[MYPAINT_BRUSH_STATE_FLIP] == 0) {
-      self->states[MYPAINT_BRUSH_STATE_FLIP] = +1;
-    } else {
-      self->states[MYPAINT_BRUSH_STATE_FLIP] *= -1;
-    }
 
     // FIXME: does happen (interpolation problem?)
     if (self->states[MYPAINT_BRUSH_STATE_PRESSURE] <= 0.0) self->states[MYPAINT_BRUSH_STATE_PRESSURE] = 0.0;
@@ -510,40 +490,23 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
     // now follows input handling
 
     float norm_dx, norm_dy, norm_dist, norm_speed;
-    //adjust speed with viewzoom
-    norm_dx = step_dx / step_dtime *self->states[MYPAINT_BRUSH_STATE_VIEWZOOM];
-    norm_dy = step_dy / step_dtime *self->states[MYPAINT_BRUSH_STATE_VIEWZOOM];
-
+    norm_dx = step_dx / step_dtime / base_radius;
+    norm_dy = step_dy / step_dtime / base_radius;
     norm_speed = hypotf(norm_dx, norm_dy);
-    //norm_dist should relate to brush size, whereas norm_speed should not
-    norm_dist = hypotf(step_dx / step_dtime / base_radius, step_dy / step_dtime / base_radius) * step_dtime;
+    norm_dist = norm_speed * step_dtime;
 
     inputs[MYPAINT_BRUSH_INPUT_PRESSURE] = pressure * expf(mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_PRESSURE_GAIN_LOG]));
-    inputs[MYPAINT_BRUSH_INPUT_SPEED1] = log(self->speed_mapping_gamma[0] + self->states[MYPAINT_BRUSH_STATE_NORM_SPEED1_SLOW])*self->speed_mapping_m[0] + self->speed_mapping_q[0], 0.0, 4.0;
-    inputs[MYPAINT_BRUSH_INPUT_SPEED2] = log(self->speed_mapping_gamma[1] + self->states[MYPAINT_BRUSH_STATE_NORM_SPEED2_SLOW])*self->speed_mapping_m[1] + self->speed_mapping_q[1], 0.0, 4.0;
-    
-    inputs[MYPAINT_BRUSH_INPUT_RANDOM] = self->random_input;
+    inputs[MYPAINT_BRUSH_INPUT_SPEED1] = log(self->speed_mapping_gamma[0] + self->states[MYPAINT_BRUSH_STATE_NORM_SPEED1_SLOW])*self->speed_mapping_m[0] + self->speed_mapping_q[0];
+    inputs[MYPAINT_BRUSH_INPUT_SPEED2] = log(self->speed_mapping_gamma[1] + self->states[MYPAINT_BRUSH_STATE_NORM_SPEED2_SLOW])*self->speed_mapping_m[1] + self->speed_mapping_q[1];
+    inputs[MYPAINT_BRUSH_INPUT_RANDOM] = rng_double_next(self->rng);
     inputs[MYPAINT_BRUSH_INPUT_STROKE] = MIN(self->states[MYPAINT_BRUSH_STATE_STROKE], 1.0);
-    //correct direction for varying view rotation
-    inputs[MYPAINT_BRUSH_INPUT_DIRECTION] = mod_arith(atan2f (self->states[MYPAINT_BRUSH_STATE_DIRECTION_DY], self->states[MYPAINT_BRUSH_STATE_DIRECTION_DX])/(2*M_PI)*360 + self->states[MYPAINT_BRUSH_STATE_VIEWROTATION] + 180.0, 180.0);
-    inputs[MYPAINT_BRUSH_INPUT_DIRECTION_ANGLE] = fmodf(atan2f(self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DY], self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DX]) / (2 * M_PI) * 360 + self->states[MYPAINT_BRUSH_STATE_VIEWROTATION] + 360.0, 360.0) ;
+    inputs[MYPAINT_BRUSH_INPUT_DIRECTION] = fmodf (atan2f (self->states[MYPAINT_BRUSH_STATE_DIRECTION_DY], self->states[MYPAINT_BRUSH_STATE_DIRECTION_DX])/(2*M_PI)*360 + 180.0, 180.0);
     inputs[MYPAINT_BRUSH_INPUT_TILT_DECLINATION] = self->states[MYPAINT_BRUSH_STATE_DECLINATION];
-    //correct ascension for varying view rotation, use custom mod
-    inputs[MYPAINT_BRUSH_INPUT_TILT_ASCENSION] = mod_arith(self->states[MYPAINT_BRUSH_STATE_ASCENSION] + self->states[MYPAINT_BRUSH_STATE_VIEWROTATION] + 180.0, 360.0) - 180.0;
-    inputs[MYPAINT_BRUSH_INPUT_VIEWZOOM] = (mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_RADIUS_LOGARITHMIC])) - logf(base_radius * 1 / self->states[MYPAINT_BRUSH_STATE_VIEWZOOM]);
-    inputs[MYPAINT_BRUSH_INPUT_ATTACK_ANGLE] = smallest_angular_difference(self->states[MYPAINT_BRUSH_STATE_ASCENSION], mod_arith(atan2f(self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DY], self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DX]) / (2 * M_PI) * 360 + 90, 360));
-    inputs[MYPAINT_BRUSH_INPUT_BRUSH_RADIUS] = mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_RADIUS_LOGARITHMIC]);
-    inputs[MYPAINT_BRUSH_INPUT_GRIDMAP_X] = CLAMP(self->states[MYPAINT_BRUSH_STATE_GRIDMAP_X], 0.0, 256.0);
-    inputs[MYPAINT_BRUSH_INPUT_GRIDMAP_Y] = CLAMP(self->states[MYPAINT_BRUSH_STATE_GRIDMAP_Y], 0.0, 256.0);
-    inputs[MYPAINT_BRUSH_INPUT_TILT_DECLINATIONX] = self->states[MYPAINT_BRUSH_STATE_DECLINATIONX];
-    inputs[MYPAINT_BRUSH_INPUT_TILT_DECLINATIONY] = self->states[MYPAINT_BRUSH_STATE_DECLINATIONY];
-    inputs[MYPAINT_BRUSH_INPUT_ATTACK_ANGLE] = smallest_angular_difference(self->states[MYPAINT_BRUSH_STATE_ASCENSION], mod_arith(atan2f(self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DY], self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DX]) / (2 * M_PI) * 360 + 90 + self->states[MYPAINT_BRUSH_STATE_VIEWROTATION], 360));
+    inputs[MYPAINT_BRUSH_INPUT_TILT_ASCENSION] = fmodf(self->states[MYPAINT_BRUSH_STATE_ASCENSION] + 180.0, 360.0) - 180.0;
 
     inputs[MYPAINT_BRUSH_INPUT_CUSTOM] = self->states[MYPAINT_BRUSH_STATE_CUSTOM_INPUT];
-    inputs[MYPAINT_BRUSH_INPUT_BARREL_ROTATION] = mod_arith(self->states[MYPAINT_BRUSH_STATE_BARREL_ROTATION], 360);
-
     if (self->print_inputs) {
-      printf("press=% 4.3f, speed1=% 4.4f\tspeed2=% 4.4f\tstroke=% 4.3f\tcustom=% 4.3f\tviewzoom=% 4.3f\tviewrotation=% 4.3f\tasc=% 4.3f\tdir=% 4.3f\tdec=% 4.3f\tdabang=% 4.3f\txtilt=% 4.3f\tytilt=% 4.3fattack=% 4.3f\n", (double)inputs[MYPAINT_BRUSH_INPUT_PRESSURE], (double)inputs[MYPAINT_BRUSH_INPUT_SPEED1], (double)inputs[MYPAINT_BRUSH_INPUT_SPEED2], (double)inputs[MYPAINT_BRUSH_INPUT_STROKE], (double)inputs[MYPAINT_BRUSH_INPUT_CUSTOM], (double)inputs[MYPAINT_BRUSH_INPUT_VIEWZOOM], (double)self->states[MYPAINT_BRUSH_STATE_VIEWROTATION], (double)inputs[MYPAINT_BRUSH_INPUT_TILT_ASCENSION], (double)inputs[MYPAINT_BRUSH_INPUT_DIRECTION], (double)inputs[MYPAINT_BRUSH_INPUT_TILT_DECLINATION], (double)self->states[MYPAINT_BRUSH_STATE_ACTUAL_ELLIPTICAL_DAB_ANGLE], (double)inputs[MYPAINT_BRUSH_INPUT_TILT_DECLINATIONX], (double)inputs[MYPAINT_BRUSH_INPUT_TILT_DECLINATIONY], (double)inputs[MYPAINT_BRUSH_INPUT_ATTACK_ANGLE]);
+      printf("press=% 4.3f, speed1=% 4.4f\tspeed2=% 4.4f\tstroke=% 4.3f\tcustom=% 4.3f\n", (double)inputs[MYPAINT_BRUSH_INPUT_PRESSURE], (double)inputs[MYPAINT_BRUSH_INPUT_SPEED1], (double)inputs[MYPAINT_BRUSH_INPUT_SPEED2], (double)inputs[MYPAINT_BRUSH_INPUT_STROKE], (double)inputs[MYPAINT_BRUSH_INPUT_CUSTOM]);
     }
     // FIXME: this one fails!!!
     //assert(inputs[MYPAINT_BRUSH_INPUT_SPEED1] >= 0.0 && inputs[MYPAINT_BRUSH_INPUT_SPEED1] < 1e8); // checking for inf
@@ -584,22 +547,13 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
     }
 
     { // orientation (similar lowpass filter as above, but use dabtime instead of wallclock time)
-      //adjust speed with viewzoom
-      float dx = step_dx *self->states[MYPAINT_BRUSH_STATE_VIEWZOOM];
-      float dy = step_dy *self->states[MYPAINT_BRUSH_STATE_VIEWZOOM];
-
-
-
+      float dx = step_dx / base_radius;
+      float dy = step_dy / base_radius;
       float step_in_dabtime = hypotf(dx, dy); // FIXME: are we recalculating something here that we already have?
-      float fac = 1.0 - exp_decay (expf(self->settings_value[MYPAINT_BRUSH_SETTING_DIRECTION_FILTER]*0.5)-1.0, step_in_dabtime);
+      float fac = 1.0 - exp_decay (exp(self->settings_value[MYPAINT_BRUSH_SETTING_DIRECTION_FILTER]*0.5)-1.0, step_in_dabtime);
 
       float dx_old = self->states[MYPAINT_BRUSH_STATE_DIRECTION_DX];
       float dy_old = self->states[MYPAINT_BRUSH_STATE_DIRECTION_DY];
-      
-      // 360 Direction
-      self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DX] += (dx - self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DX]) * fac;
-      self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DY] += (dy - self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DY]) * fac;
-      
       // use the opposite speed vector if it is closer (we don't care about 180 degree turns)
       if (SQR(dx_old-dx) + SQR(dy_old-dy) > SQR(dx_old-(-dx)) + SQR(dy_old-(-dy))) {
         dx = -dx;
@@ -642,10 +596,9 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
     if (self->states[MYPAINT_BRUSH_STATE_ACTUAL_RADIUS] < ACTUAL_RADIUS_MIN) self->states[MYPAINT_BRUSH_STATE_ACTUAL_RADIUS] = ACTUAL_RADIUS_MIN;
     if (self->states[MYPAINT_BRUSH_STATE_ACTUAL_RADIUS] > ACTUAL_RADIUS_MAX) self->states[MYPAINT_BRUSH_STATE_ACTUAL_RADIUS] = ACTUAL_RADIUS_MAX;
 
-    // aspect ratio (needs to be calculated here because it can affect the dab spacing)
+    // aspect ratio (needs to be caluclated here because it can affect the dab spacing)
     self->states[MYPAINT_BRUSH_STATE_ACTUAL_ELLIPTICAL_DAB_RATIO] = self->settings_value[MYPAINT_BRUSH_SETTING_ELLIPTICAL_DAB_RATIO];
-    //correct dab angle for view rotation
-    self->states[MYPAINT_BRUSH_STATE_ACTUAL_ELLIPTICAL_DAB_ANGLE] = mod_arith(self->settings_value[MYPAINT_BRUSH_SETTING_ELLIPTICAL_DAB_ANGLE] - self->states[MYPAINT_BRUSH_STATE_VIEWROTATION] + 180.0, 180.0) - 180.0;
+    self->states[MYPAINT_BRUSH_STATE_ACTUAL_ELLIPTICAL_DAB_ANGLE] = self->settings_value[MYPAINT_BRUSH_SETTING_ELLIPTICAL_DAB_ANGLE];
   }
 
   // Called only from stroke_to(). Calculate everything needed to
@@ -670,8 +623,8 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
       // dabs_per_pixel is just estimated roughly, I didn't think hard
       // about the case when the radius changes during the stroke
       dabs_per_pixel = (
-                        self->states[MYPAINT_BRUSH_STATE_DABS_PER_ACTUAL_RADIUS] +
-                        self->states[MYPAINT_BRUSH_STATE_DABS_PER_BASIC_RADIUS]
+                        mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_DABS_PER_ACTUAL_RADIUS]) +
+                        mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_DABS_PER_BASIC_RADIUS])
                         ) * 2.0;
 
       // the correction is probably not wanted if the dabs don't overlap
@@ -694,67 +647,10 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
     y = self->states[MYPAINT_BRUSH_STATE_ACTUAL_Y];
 
     float base_radius = expf(mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_RADIUS_LOGARITHMIC]));
-    float offset_mult = expf(self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_MULTIPLIER]);
-
-    if (self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_X]) {
-      x += self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_X] * base_radius * offset_mult;
-    }
-
-    if (self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_Y]) {
-      y += self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_Y] * base_radius * offset_mult;
-    }
-    
-    //Anti_Art offsets tweaked by BrienD.  Adjusted with ANGLE_ADJ and OFFSET_MULTIPLIER
-    //offset to one side of direction
-    if (self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE]) {
-      x += cos((fmodf ((atan2f(self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DY], self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DX]) ) / (2 * M_PI) * 360 - 90, 360.0) + self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_ADJ])* M_PI / 180) * base_radius * self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE] * offset_mult;
-      y += sin((fmodf ((atan2f(self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DY], self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DX]) ) / (2 * M_PI) * 360 - 90, 360.0) + self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_ADJ])* M_PI / 180) * base_radius * self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE] * offset_mult;
-    }
-
-    //offset to one side of ascension angle
-    if (self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_ASC]) {
-      x += cos((self->states[MYPAINT_BRUSH_STATE_ASCENSION] - self->states[MYPAINT_BRUSH_STATE_VIEWROTATION] + self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_ADJ]) * M_PI / 180) * base_radius * self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_ASC] * offset_mult;
-      y += sin((self->states[MYPAINT_BRUSH_STATE_ASCENSION] - self->states[MYPAINT_BRUSH_STATE_VIEWROTATION] + self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_ADJ]) * M_PI / 180) * base_radius * self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_ASC] * offset_mult;
-      }
-
-    //offset to one side of view orientation
-    if (self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_VIEW]) {
-      x += sin((self->states[MYPAINT_BRUSH_STATE_VIEWROTATION] + 90 + self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_ADJ]) * M_PI / 180) * base_radius * self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_VIEW] * offset_mult;
-      y += cos((self->states[MYPAINT_BRUSH_STATE_VIEWROTATION] + 90 + self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_ADJ]) * M_PI / 180) * base_radius * self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_VIEW] * offset_mult;
-    }
-
-    //offset mirrored to sides of direction
-    if (self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_2]) {
-      
-      if (self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_2] < 0) {
-        self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_2] = 0;
-      }
-      x += cos((fmodf ((atan2f(self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DY], self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DX]) ) / (2 * M_PI) * 360 - 90, 360.0) + self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_ADJ] * self->states[MYPAINT_BRUSH_STATE_FLIP])* M_PI / 180) * base_radius * self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_2] * offset_mult * self->states[MYPAINT_BRUSH_STATE_FLIP];
-      y += sin((fmodf ((atan2f(self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DY], self->states[MYPAINT_BRUSH_STATE_DIRECTION_ANGLE_DX]) ) / (2 * M_PI) * 360 - 90, 360.0) + self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_ADJ] * self->states[MYPAINT_BRUSH_STATE_FLIP])* M_PI / 180) * base_radius * self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_2] * offset_mult * self->states[MYPAINT_BRUSH_STATE_FLIP];
-    }
-
-    //offset mirrored to sides of ascension angle
-    if (self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_2_ASC]) {
-      
-      if (self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_2_ASC] < 0) {
-        self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_2_ASC] = 0;
-      }
-      x += cos((self->states[MYPAINT_BRUSH_STATE_ASCENSION] - self->states[MYPAINT_BRUSH_STATE_VIEWROTATION] + self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_ADJ] * self->states[MYPAINT_BRUSH_STATE_FLIP]) * M_PI / 180) * base_radius * self->states[MYPAINT_BRUSH_STATE_FLIP] * self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_2_ASC] * offset_mult;
-      y += sin((self->states[MYPAINT_BRUSH_STATE_ASCENSION] - self->states[MYPAINT_BRUSH_STATE_VIEWROTATION] + self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_ADJ] * self->states[MYPAINT_BRUSH_STATE_FLIP]) * M_PI / 180) * base_radius * self->states[MYPAINT_BRUSH_STATE_FLIP] * self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_2_ASC] * offset_mult;
-    }
-
-    //offset mirrored to sides of view orientation
-    if (self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_2_VIEW]) {
-      if (self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_2_VIEW] < 0) {
-        self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_2_VIEW] = 0;
-      }
-      x += sin((self->states[MYPAINT_BRUSH_STATE_VIEWROTATION] + 90 + self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_ADJ]) * M_PI / 180) * base_radius * self->states[MYPAINT_BRUSH_STATE_FLIP] * self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_2_VIEW] * offset_mult;
-      y += cos((self->states[MYPAINT_BRUSH_STATE_VIEWROTATION] + 90 + self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_ADJ]) * M_PI / 180) * base_radius * self->states[MYPAINT_BRUSH_STATE_FLIP] * self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_ANGLE_2_VIEW] * offset_mult;
-    }
 
     if (self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_BY_SPEED]) {
-      x += self->states[MYPAINT_BRUSH_STATE_NORM_DX_SLOW] * self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_BY_SPEED] * 0.1 / self->states[MYPAINT_BRUSH_STATE_VIEWZOOM];
-      y += self->states[MYPAINT_BRUSH_STATE_NORM_DY_SLOW] * self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_BY_SPEED] * 0.1 / self->states[MYPAINT_BRUSH_STATE_VIEWZOOM];
+      x += self->states[MYPAINT_BRUSH_STATE_NORM_DX_SLOW] * self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_BY_SPEED] * 0.1 * base_radius;
+      y += self->states[MYPAINT_BRUSH_STATE_NORM_DY_SLOW] * self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_BY_SPEED] * 0.1 * base_radius;
     }
 
     if (self->settings_value[MYPAINT_BRUSH_SETTING_OFFSET_BY_RANDOM]) {
@@ -763,6 +659,7 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
       x += rand_gauss (self->rng) * amp * base_radius;
       y += rand_gauss (self->rng) * amp * base_radius;
     }
+
 
     radius = self->states[MYPAINT_BRUSH_STATE_ACTUAL_RADIUS];
     if (self->settings_value[MYPAINT_BRUSH_SETTING_RADIUS_BY_RANDOM]) {
@@ -779,17 +676,10 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
       }
     }
 
-    //convert to RGB here instead of later
-    // color part
-    float color_h = mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_COLOR_H]);
-    float color_s = mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_COLOR_S]);
-    float color_v = mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_COLOR_V]);
-    hsv_to_rgb_float (&color_h, &color_s, &color_v);
     // update smudge color
     if (self->settings_value[MYPAINT_BRUSH_SETTING_SMUDGE_LENGTH] < 1.0 &&
-       // optimization, since normal brushes have smudge_length == 0.5 without actually smudging
-       (self->settings_value[MYPAINT_BRUSH_SETTING_SMUDGE] != 0.0 ||
-       !mypaint_mapping_is_constant(self->settings[MYPAINT_BRUSH_SETTING_SMUDGE]))) {
+        // optimization, since normal brushes have smudge_length == 0.5 without actually smudging
+        (self->settings_value[MYPAINT_BRUSH_SETTING_SMUDGE] != 0.0 || !mypaint_mapping_is_constant(self->settings[MYPAINT_BRUSH_SETTING_SMUDGE]))) {
 
       float fac = self->settings_value[MYPAINT_BRUSH_SETTING_SMUDGE_LENGTH];
       if (fac < 0.01) fac = 0.01;
@@ -797,128 +687,72 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
       px = ROUND(x);
       py = ROUND(y);
 
-      //determine which smudge bucket to use and update
-      int bucket = CLAMP(roundf(self->settings_value[MYPAINT_BRUSH_SETTING_SMUDGE_BUCKET]), 0, 255);
-
       // Calling get_color() is almost as expensive as rendering a
       // dab. Because of this we use the previous value if it is not
       // expected to hurt quality too much. We call it at most every
       // second dab.
       float r, g, b, a;
-
-      smudge_buckets[bucket][8] *= fac;
-      if (smudge_buckets[bucket][8] < (powf(0.5*fac, self->settings_value[MYPAINT_BRUSH_SETTING_SMUDGE_LENGTH_LOG])) + 0.0000000000000001) {
-        if (smudge_buckets[bucket][8] == 0.0) {
+      self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_RECENTNESS] *= fac;
+      if (self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_RECENTNESS] < 0.5*fac) {
+        if (self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_RECENTNESS] == 0.0) {
           // first initialization of smudge color
           fac = 0.0;
         }
-        smudge_buckets[bucket][8] = 1.0;
+        self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_RECENTNESS] = 1.0;
 
         float smudge_radius = radius * expf(self->settings_value[MYPAINT_BRUSH_SETTING_SMUDGE_RADIUS_LOG]);
         smudge_radius = CLAMP(smudge_radius, ACTUAL_RADIUS_MIN, ACTUAL_RADIUS_MAX);
+        mypaint_surface_get_color(surface, px, py, smudge_radius, &r, &g, &b, &a);
 
-        mypaint_surface_get_color(surface, px, py, smudge_radius, &r, &g, &b, &a, self->settings_value[MYPAINT_BRUSH_SETTING_PAINT_MODE]);
-
-
-        //don't draw unless the picked-up alpha is above a certain level
-        //this is sort of like lock_alpha but for smudge
-        //negative values reverse this idea
-        if ((self->settings_value[MYPAINT_BRUSH_SETTING_SMUDGE_TRANSPARENCY] > 0.0 && 
-             a < self->settings_value[MYPAINT_BRUSH_SETTING_SMUDGE_TRANSPARENCY]) ||
-             (self->settings_value[MYPAINT_BRUSH_SETTING_SMUDGE_TRANSPARENCY] < 0.0 && 
-             a > self->settings_value[MYPAINT_BRUSH_SETTING_SMUDGE_TRANSPARENCY] * -1)) {
-          return FALSE;
-        }
-        //avoid color noise from low alpha
-        if (a > WGM_EPSILON * 10) { 
-          smudge_buckets[bucket][4] = r;
-          smudge_buckets[bucket][5] = g;
-          smudge_buckets[bucket][6] = b;
-          smudge_buckets[bucket][7] = a;
-        } else {
-          fac = 1.0;
-        }
+        self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_R] = r;
+        self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_G] = g;
+        self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_B] = b;
+        self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_A] = a;
       } else {
-        r = smudge_buckets[bucket][4];
-        g = smudge_buckets[bucket][5];
-        b = smudge_buckets[bucket][6];
-        a = smudge_buckets[bucket][7];
+        r = self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_R];
+        g = self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_G];
+        b = self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_B];
+        a = self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_A];
       }
-      
-      float smudge_state[4] = {smudge_buckets[bucket][0], smudge_buckets[bucket][1], smudge_buckets[bucket][2], smudge_buckets[bucket][3]};
-      
-      float smudge_get[4] = {r, g, b, a};
 
-      float *smudge_new;
-      smudge_new = mix_colors(smudge_state,
-                              smudge_get,
-                              fac,
-                              self->settings_value[MYPAINT_BRUSH_SETTING_PAINT_MODE] );
-      // updated the smudge color (stored with straight alpha)
-      smudge_buckets[bucket][0] = smudge_new[0];
-      smudge_buckets[bucket][1] = smudge_new[1];
-      smudge_buckets[bucket][2] = smudge_new[2];
-      smudge_buckets[bucket][3] = smudge_new[3];
-      
-      //update all the states
-      self->states[MYPAINT_BRUSH_STATE_SMUDGE_RA] = smudge_buckets[bucket][0];
-      self->states[MYPAINT_BRUSH_STATE_SMUDGE_GA] = smudge_buckets[bucket][1];
-      self->states[MYPAINT_BRUSH_STATE_SMUDGE_BA] = smudge_buckets[bucket][2];
-      self->states[MYPAINT_BRUSH_STATE_SMUDGE_A] = smudge_buckets[bucket][3];
-      self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_R] = smudge_buckets[bucket][4];
-      self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_G] = smudge_buckets[bucket][5];
-      self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_B] = smudge_buckets[bucket][6];
-      self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_A] = smudge_buckets[bucket][7];
-      self->states[MYPAINT_BRUSH_STATE_LAST_GETCOLOR_RECENTNESS] = smudge_buckets[bucket][8];
+      // updated the smudge color (stored with premultiplied alpha)
+      self->states[MYPAINT_BRUSH_STATE_SMUDGE_A ] = fac*self->states[MYPAINT_BRUSH_STATE_SMUDGE_A ] + (1-fac)*a;
+      // fix rounding errors
+      self->states[MYPAINT_BRUSH_STATE_SMUDGE_A ] = CLAMP(self->states[MYPAINT_BRUSH_STATE_SMUDGE_A], 0.0, 1.0);
+
+      self->states[MYPAINT_BRUSH_STATE_SMUDGE_RA] = fac*self->states[MYPAINT_BRUSH_STATE_SMUDGE_RA] + (1-fac)*r*a;
+      self->states[MYPAINT_BRUSH_STATE_SMUDGE_GA] = fac*self->states[MYPAINT_BRUSH_STATE_SMUDGE_GA] + (1-fac)*g*a;
+      self->states[MYPAINT_BRUSH_STATE_SMUDGE_BA] = fac*self->states[MYPAINT_BRUSH_STATE_SMUDGE_BA] + (1-fac)*b*a;
     }
 
+    // color part
 
+    float color_h = mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_COLOR_H]);
+    float color_s = mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_COLOR_S]);
+    float color_v = mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_COLOR_V]);
     float eraser_target_alpha = 1.0;
-
     if (self->settings_value[MYPAINT_BRUSH_SETTING_SMUDGE] > 0.0) {
+      // mix (in RGB) the smudge color with the brush color
+      hsv_to_rgb_float (&color_h, &color_s, &color_v);
       float fac = self->settings_value[MYPAINT_BRUSH_SETTING_SMUDGE];
-      //hsv_to_rgb_float (&color_h, &color_s, &color_v);
-
-      //determine which smudge bucket to use when mixing with brush color
-      int bucket = CLAMP(roundf(self->settings_value[MYPAINT_BRUSH_SETTING_SMUDGE_BUCKET]), 0, 255);
-            
       if (fac > 1.0) fac = 1.0;
-        // If the smudge color somewhat transparent, then the resulting
-        // dab will do erasing towards that transparency level.
-        // see also ../doc/smudge_math.png
-        eraser_target_alpha = (1-fac)*1.0 + fac*smudge_buckets[bucket][3];
-        // fix rounding errors (they really seem to happen in the previous line)
-        eraser_target_alpha = CLAMP(eraser_target_alpha, 0.0, 1.0);
-        if (eraser_target_alpha > 0) {
-          
-          float smudge_state[4] = {
-            smudge_buckets[bucket][0],
-            smudge_buckets[bucket][1],
-            smudge_buckets[bucket][2], 
-            smudge_buckets[bucket][3]
-          };
-          float brush_color[4] = {color_h, color_s, color_v, 1.0};
-          float *color_new;
-          
-          color_new = mix_colors(
-            smudge_state,
-            brush_color,
-            fac,
-            self->settings_value[MYPAINT_BRUSH_SETTING_PAINT_MODE]
-          );  
-          
-          color_h = color_new[0];// / eraser_target_alpha;
-          color_s = color_new[1];// / eraser_target_alpha;
-          color_v = color_new[2];// / eraser_target_alpha;
-
-        } else {
-          // we are only erasing; the color does not matter
-          color_h = 1.0;
-          color_s = 1.0;
-          color_v = 1.0;
-        }
-        
-      //rgb_to_hsv_float (&color_h, &color_s, &color_v);
+      // If the smudge color somewhat transparent, then the resulting
+      // dab will do erasing towards that transparency level.
+      // see also ../doc/smudge_math.png
+      eraser_target_alpha = (1-fac)*1.0 + fac*self->states[MYPAINT_BRUSH_STATE_SMUDGE_A];
+      // fix rounding errors (they really seem to happen in the previous line)
+      eraser_target_alpha = CLAMP(eraser_target_alpha, 0.0, 1.0);
+      if (eraser_target_alpha > 0) {
+        color_h = (fac*self->states[MYPAINT_BRUSH_STATE_SMUDGE_RA] + (1-fac)*color_h) / eraser_target_alpha;
+        color_s = (fac*self->states[MYPAINT_BRUSH_STATE_SMUDGE_GA] + (1-fac)*color_s) / eraser_target_alpha;
+        color_v = (fac*self->states[MYPAINT_BRUSH_STATE_SMUDGE_BA] + (1-fac)*color_v) / eraser_target_alpha;
+      } else {
+        // we are only erasing; the color does not matter
+        color_h = 1.0;
+        color_s = 0.0;
+        color_v = 0.0;
+      }
+      rgb_to_hsv_float (&color_h, &color_s, &color_v);
     }
 
     // eraser
@@ -927,28 +761,20 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
     }
 
     // HSV color change
-    if (self->settings_value[MYPAINT_BRUSH_SETTING_CHANGE_COLOR_H] || 
-        self->settings_value[MYPAINT_BRUSH_SETTING_CHANGE_COLOR_HSV_S] ||
-        self->settings_value[MYPAINT_BRUSH_SETTING_CHANGE_COLOR_V]) {
-      rgb_to_hsv_float (&color_h, &color_s, &color_v);
-      color_h += self->settings_value[MYPAINT_BRUSH_SETTING_CHANGE_COLOR_H];
-      color_s += color_s * color_v * self->settings_value[MYPAINT_BRUSH_SETTING_CHANGE_COLOR_HSV_S];
-      color_v += self->settings_value[MYPAINT_BRUSH_SETTING_CHANGE_COLOR_V];
-      hsv_to_rgb_float (&color_h, &color_s, &color_v);
-    }
+    color_h += self->settings_value[MYPAINT_BRUSH_SETTING_CHANGE_COLOR_H];
+    color_s += self->settings_value[MYPAINT_BRUSH_SETTING_CHANGE_COLOR_HSV_S];
+    color_v += self->settings_value[MYPAINT_BRUSH_SETTING_CHANGE_COLOR_V];
 
     // HSL color change
     if (self->settings_value[MYPAINT_BRUSH_SETTING_CHANGE_COLOR_L] || self->settings_value[MYPAINT_BRUSH_SETTING_CHANGE_COLOR_HSL_S]) {
-      // (calculating way too much here, can be optimized if necessary)
+      // (calculating way too much here, can be optimized if neccessary)
       // this function will CLAMP the inputs
-      
-      //hsv_to_rgb_float (&color_h, &color_s, &color_v);
+      hsv_to_rgb_float (&color_h, &color_s, &color_v);
       rgb_to_hsl_float (&color_h, &color_s, &color_v);
       color_v += self->settings_value[MYPAINT_BRUSH_SETTING_CHANGE_COLOR_L];
-      color_s += color_s * MIN(fabsf(1.0 - color_v), fabsf(color_v)) * 2.0
-        * self->settings_value[MYPAINT_BRUSH_SETTING_CHANGE_COLOR_HSL_S];
+      color_s += self->settings_value[MYPAINT_BRUSH_SETTING_CHANGE_COLOR_HSL_S];
       hsl_to_rgb_float (&color_h, &color_s, &color_v);
-      //rgb_to_hsv_float (&color_h, &color_s, &color_v);
+      rgb_to_hsv_float (&color_h, &color_s, &color_v);
     }
 
     float hardness = CLAMP(self->settings_value[MYPAINT_BRUSH_SETTING_HARDNESS], 0.0, 1.0);
@@ -992,18 +818,18 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
       if (snapToPixel > 0.9999 )
       {
         snapped_radius -= 0.0001; // this fixes precision issues where
-                                  // neighbor pixels could be wrongly painted
+                                  // neighboor pixels could be wrongly painted
       }
 
       radius = radius + (snapped_radius - radius) * snapToPixel;
     }
 
     // the functions below will CLAMP most inputs
-    //hsv_to_rgb_float (&color_h, &color_s, &color_v);
+    hsv_to_rgb_float (&color_h, &color_s, &color_v);
     return mypaint_surface_draw_dab (surface, x, y, radius, color_h, color_s, color_v, opaque, hardness, eraser_target_alpha,
                               self->states[MYPAINT_BRUSH_STATE_ACTUAL_ELLIPTICAL_DAB_RATIO], self->states[MYPAINT_BRUSH_STATE_ACTUAL_ELLIPTICAL_DAB_ANGLE],
                               self->settings_value[MYPAINT_BRUSH_SETTING_LOCK_ALPHA],
-                              self->settings_value[MYPAINT_BRUSH_SETTING_COLORIZE], self->settings_value[MYPAINT_BRUSH_SETTING_POSTERIZE], self->settings_value[MYPAINT_BRUSH_SETTING_POSTERIZE_NUM], self->settings_value[MYPAINT_BRUSH_SETTING_PAINT_MODE]);
+                              self->settings_value[MYPAINT_BRUSH_SETTING_COLORIZE]);
   }
 
   // How many dabs will be drawn between the current and the next (x, y, pressure, +dt) position?
@@ -1044,17 +870,13 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
 
     // FIXME: no need for base_value or for the range checks above IF always the interpolation
     //        function will be called before this one
-    res1 = dist / self->states[MYPAINT_BRUSH_STATE_ACTUAL_RADIUS] * self->states[MYPAINT_BRUSH_STATE_DABS_PER_ACTUAL_RADIUS];
-    res2 = dist / base_radius   * self->states[MYPAINT_BRUSH_STATE_DABS_PER_BASIC_RADIUS];
-    res3 = dt * self->states[MYPAINT_BRUSH_STATE_DABS_PER_SECOND];
-    //on first load if isnan the engine messes up and won't paint
-    //until you switch modes
-    float res4 = res1 + res2 + res3;
-    if (isnan(res4) || res4 < 0.0) { res4 = 0.0; }
-    return res4;
+    res1 = dist / self->states[MYPAINT_BRUSH_STATE_ACTUAL_RADIUS] * mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_DABS_PER_ACTUAL_RADIUS]);
+    res2 = dist / base_radius   * mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_DABS_PER_BASIC_RADIUS]);
+    res3 = dt * mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_DABS_PER_SECOND]);
+    return res1 + res2 + res3;
   }
 
-  /**
+  /** 
    * mypaint_brush_stroke_to:
    * @dtime: Time since last motion event, in seconds.
    *
@@ -1064,16 +886,12 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
    */
   int mypaint_brush_stroke_to (MyPaintBrush *self, MyPaintSurface *surface,
                                 float x, float y, float pressure,
-                                float xtilt, float ytilt, double dtime, float viewzoom, float viewrotation, float barrel_rotation)
+                                float xtilt, float ytilt, double dtime)
   {
-    const float max_dtime = 5;
-
     //printf("%f %f %f %f\n", (double)dtime, (double)x, (double)y, (double)pressure);
 
     float tilt_ascension = 0.0;
     float tilt_declination = 90.0;
-    float tilt_declinationx = 90.0;
-    float tilt_declinationy = 90.0;
     if (xtilt != 0 || ytilt != 0) {
       // shield us from insane tilt input
       xtilt = CLAMP(xtilt, -1.0, 1.0);
@@ -1083,13 +901,9 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
       tilt_ascension = 180.0*atan2(-xtilt, ytilt)/M_PI;
       const float rad = hypot(xtilt, ytilt);
       tilt_declination = 90-(rad*60);
-      tilt_declinationx = (xtilt * 60);
-      tilt_declinationy = (ytilt * 60);
 
       assert(isfinite(tilt_ascension));
       assert(isfinite(tilt_declination));
-      assert(isfinite(tilt_declinationx));
-      assert(isfinite(tilt_declinationy));
     }
 
     // printf("xtilt %f, ytilt %f\n", (double)xtilt, (double)ytilt);
@@ -1103,9 +917,6 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
       x = 0.0;
       y = 0.0;
       pressure = 0.0;
-      viewzoom = 0.0;
-      viewrotation = 0.0;
-      barrel_rotation = 0.0;
     }
     // the assertion below is better than out-of-memory later at save time
     assert(x < 1e8 && y < 1e8 && x > -1e8 && y > -1e8);
@@ -1120,29 +931,9 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
     if (dtime > 0.100 && pressure && self->states[MYPAINT_BRUSH_STATE_PRESSURE] == 0) {
       // Workaround for tablets that don't report motion events without pressure.
       // This is to avoid linear interpolation of the pressure between two events.
-      mypaint_brush_stroke_to (self, surface, x, y, 0.0, 90.0, 0.0, dtime-0.0001, viewzoom, viewrotation, 0.0);
+      mypaint_brush_stroke_to (self, surface, x, y, 0.0, 90.0, 0.0, dtime-0.0001);
       dtime = 0.0001;
     }
-
-    // skip some length of input if requested (for stable tracking noise)
-    if (self->skip > 0.001) {
-      float dist = hypotf(self->skip_last_x-x, self->skip_last_y-y);
-      self->skip_last_x = x;
-      self->skip_last_y = y;
-      self->skipped_dtime += dtime;
-      self->skip -= dist;
-      dtime = self->skipped_dtime;
-
-      if (self->skip > 0.001 && !(dtime > max_dtime || self->reset_requested))
-        return TRUE;
-
-      // skipped
-      self->skip = 0;
-      self->skip_last_x = 0;
-      self->skip_last_y = 0;
-      self->skipped_dtime = 0;
-    }
-
 
     { // calculate the actual "virtual" cursor position
 
@@ -1150,19 +941,9 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
       if (mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_TRACKING_NOISE])) {
         // OPTIMIZE: expf() called too often
         const float base_radius = expf(mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_RADIUS_LOGARITHMIC]));
-        const float noise = base_radius * mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_TRACKING_NOISE]);
 
-        if (noise > 0.001) {
-          // we need to skip some length of input to make
-          // tracking noise independent from input frequency
-          self->skip = 0.5*noise;
-          self->skip_last_x = x;
-          self->skip_last_y = y;
-
-          // add noise
-          x += noise * rand_gauss(self->rng);
-          y += noise * rand_gauss(self->rng);
-        }
+        x += rand_gauss (self->rng) * mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_TRACKING_NOISE]) * base_radius;
+        y += rand_gauss (self->rng) * mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_TRACKING_NOISE]) * base_radius;
       }
 
       const float fac = 1.0 - exp_decay (mypaint_mapping_get_base_value(self->settings[MYPAINT_BRUSH_SETTING_SLOW_TRACKING]), 100.0*dtime);
@@ -1176,17 +957,8 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
     float dabs_moved = self->states[MYPAINT_BRUSH_STATE_PARTIAL_DABS];
     float dabs_todo = count_dabs_to (self, x, y, pressure, dtime);
 
-    if (dtime > max_dtime || self->reset_requested) {
+    if (dtime > 5 || self->reset_requested) {
       self->reset_requested = FALSE;
-
-      // reset skipping
-      self->skip = 0;
-      self->skip_last_x = 0;
-      self->skip_last_y = 0;
-      self->skipped_dtime = 0;
-
-      // reset value of random input
-      self->random_input = rng_double_next(self->rng);
 
       //printf("Brush reset.\n");
       int i=0;
@@ -1212,8 +984,7 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
     double dtime_left = dtime;
 
     float step_ddab, step_dx, step_dy, step_dpressure, step_dtime;
-    float step_declination, step_ascension, step_declinationx, step_declinationy, step_viewzoom, step_viewrotation, step_barrel_rotation;
-
+    float step_declination, step_ascension;
     while (dabs_moved + dabs_todo >= 1.0) { // there are dabs pending
       { // linear interpolation (nonlinear variant was too slow, see SVN log)
         float frac; // fraction of the remaining distance to move
@@ -1231,30 +1002,16 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
         step_dtime     = frac * (dtime_left - 0.0);
         // Though it looks different, time is interpolated exactly like x/y/pressure.
         step_declination = frac * (tilt_declination - self->states[MYPAINT_BRUSH_STATE_DECLINATION]);
-        step_declinationx = frac * (tilt_declinationx - self->states[MYPAINT_BRUSH_STATE_DECLINATIONX]);
-        step_declinationy = frac * (tilt_declinationy - self->states[MYPAINT_BRUSH_STATE_DECLINATIONY]);
         step_ascension   = frac * smallest_angular_difference(self->states[MYPAINT_BRUSH_STATE_ASCENSION], tilt_ascension);
-        step_viewzoom = viewzoom;
-        step_viewrotation = viewrotation;
-        //converts barrel_ration to degrees,
-        step_barrel_rotation = frac * smallest_angular_difference(self->states[MYPAINT_BRUSH_STATE_BARREL_ROTATION],barrel_rotation * 360);
-
-        update_states_and_setting_values (self, step_ddab, step_dx, step_dy,
-                                          step_dpressure, step_declination,
-                                          step_ascension, step_dtime, step_viewzoom,
-                                          step_viewrotation, step_declinationx,
-                                          step_declinationy, step_barrel_rotation);
       }
 
+      update_states_and_setting_values (self, step_ddab, step_dx, step_dy, step_dpressure, step_declination, step_ascension, step_dtime);
       gboolean painted_now = prepare_and_draw_dab (self, surface);
       if (painted_now) {
         painted = YES;
       } else if (painted == UNKNOWN) {
         painted = NO;
       }
-
-      // update value of random input only when draw the dab
-      self->random_input = rng_double_next(self->rng);
 
       dtime_left   -= step_dtime;
       dabs_todo  = count_dabs_to (self, x, y, pressure, dtime_left);
@@ -1266,23 +1023,18 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
       // brush_count_dabs_to depends on the radius and the radius can
       // depend on something that changes much faster than just every
       // dab.
+
       step_ddab = dabs_todo; // the step "moves" the brush by a fraction of one dab
       step_dx        = x - self->states[MYPAINT_BRUSH_STATE_X];
       step_dy        = y - self->states[MYPAINT_BRUSH_STATE_Y];
       step_dpressure = pressure - self->states[MYPAINT_BRUSH_STATE_PRESSURE];
       step_declination = tilt_declination - self->states[MYPAINT_BRUSH_STATE_DECLINATION];
-      step_declinationx = tilt_declinationx - self->states[MYPAINT_BRUSH_STATE_DECLINATIONX];
-      step_declinationy = tilt_declinationy - self->states[MYPAINT_BRUSH_STATE_DECLINATIONY];
       step_ascension = smallest_angular_difference(self->states[MYPAINT_BRUSH_STATE_ASCENSION], tilt_ascension);
       step_dtime     = dtime_left;
-      step_viewzoom  = viewzoom;
-      step_viewrotation = viewrotation;
-      step_barrel_rotation = smallest_angular_difference(self->states[MYPAINT_BRUSH_STATE_BARREL_ROTATION], barrel_rotation * 360);
-      step_barrel_rotation = smallest_angular_difference(self->states[MYPAINT_BRUSH_STATE_BARREL_ROTATION],barrel_rotation * 360);
 
       //dtime_left = 0; but that value is not used any more
 
-      update_states_and_setting_values (self, step_ddab, step_dx, step_dy, step_dpressure, step_declination, step_ascension, step_dtime, step_viewzoom, step_viewrotation, step_declinationx, step_declinationy, step_barrel_rotation);
+      update_states_and_setting_values (self, step_ddab, step_dx, step_dy, step_dpressure, step_declination, step_ascension, step_dtime);
     }
 
     // save the fraction of a dab that is already done now
@@ -1329,7 +1081,7 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
       } else {
         // Usually we have pressure==0 here. But some brushes can paint
         // nothing at full pressure (eg gappy lines, or a stroke that
-        // fades out). In either case this is the preferred moment to split.
+        // fades out). In either case this is the prefered moment to split.
         if (self->stroke_total_painting_time+self->stroke_current_idling_time > 0.9 + 5*pressure) {
           return TRUE;
         }
@@ -1337,6 +1089,8 @@ mypaint_brush_set_state(MyPaintBrush *self, MyPaintBrushState i, float value)
     }
     return FALSE;
   }
+
+#ifdef HAVE_JSON_C
 
 // Compat wrapper, for supporting libjson
 static gboolean
@@ -1394,12 +1148,6 @@ update_brush_setting_from_json_object(MyPaintBrush *self,
             return FALSE;
         }
 
-        if (!(input_id >= 0 && input_id < MYPAINT_BRUSH_INPUTS_COUNT)) {
-            fprintf(stderr, "Warning: Unknown input_id: %d for input: %s\n",
-                    input_id, input_name);
-            return FALSE;
-        }
-
         const int number_of_mapping_points = json_object_array_length(input_obj);
 
         mypaint_brush_set_mapping_n(self, setting_id, input_id, number_of_mapping_points);
@@ -1453,10 +1201,12 @@ update_brush_from_json_object(MyPaintBrush *self)
     }
     return updated_any;
 }
+#endif // HAVE_JSON_C
 
 gboolean
 mypaint_brush_from_string(MyPaintBrush *self, const char *string)
 {
+#ifdef HAVE_JSON_C
     json_object *brush_json = NULL;
 
     if (self->brush_json) {
@@ -1476,6 +1226,9 @@ mypaint_brush_from_string(MyPaintBrush *self, const char *string)
         self->brush_json = json_object_new_object();
         return FALSE;
     }
+#else
+    return FALSE;
+#endif
 }
 
 

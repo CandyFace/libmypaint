@@ -9,17 +9,18 @@
 # tools and you shouldn't use this script.  Just call ./configure
 # directly.
 
-ACLOCAL=${ACLOCAL-aclocal-1.13}
+ACLOCAL=${ACLOCAL-aclocal}
 AUTOCONF=${AUTOCONF-autoconf}
 AUTOHEADER=${AUTOHEADER-autoheader}
-AUTOMAKE=${AUTOMAKE-automake-1.13}
+AUTOMAKE=${AUTOMAKE-automake}
 LIBTOOLIZE=${LIBTOOLIZE-libtoolize}
+PYTHON=${PYTHON-python}
 
-AUTOCONF_REQUIRED_VERSION=2.62
-AUTOMAKE_REQUIRED_VERSION=1.13
-INTLTOOL_REQUIRED_VERSION=0.40.1
-LIBTOOL_REQUIRED_VERSION=1.5
-LIBTOOL_WIN32_REQUIRED_VERSION=2.2
+# AUTOCONF_REQUIRED_VERSION=2.62
+# AUTOMAKE_REQUIRED_VERSION=1.13
+# INTLTOOL_REQUIRED_VERSION=0.40.1
+# LIBTOOL_REQUIRED_VERSION=1.5
+# LIBTOOL_WIN32_REQUIRED_VERSION=2.2
 
 
 PROJECT="libmypaint"
@@ -124,12 +125,10 @@ fi
 
 
 echo -n "checking for automake >= $AUTOMAKE_REQUIRED_VERSION ... "
+echo -n $AUTOMAKE
 if ($AUTOMAKE --version) < /dev/null > /dev/null 2>&1; then
    AUTOMAKE=$AUTOMAKE
    ACLOCAL=$ACLOCAL
-elif (automake-1.16 --version) < /dev/null > /dev/null 2>&1; then
-   AUTOMAKE=automake-1.16
-   ACLOCAL=aclocal-1.16
 elif (automake-1.15 --version) < /dev/null > /dev/null 2>&1; then
    AUTOMAKE=automake-1.15
    ACLOCAL=aclocal-1.15
@@ -225,20 +224,10 @@ $LIBTOOLIZE --force || exit $?
 ($AUTOHEADER --version)  < /dev/null > /dev/null 2>&1 && $AUTOHEADER || exit 1
 
 
-# Generate headers from brushsettings.json which defines "Settings"
-# (mostly visually-meaningful outputs that cause the brush engine to
-# make blobs), "Inputs" (data from the client application like zoom,
-# pressure, position, or tilt), and "States" (internal state counters
-# updated and used by the brush engine over time).
-#
-# The generated files are included in "make dist" tarballs, like the
-# configure script. The internal-only brushsettings-gen.h is also used
-# as the source of strings for gettext.
+# Generate settings headers from the relatively stable .json file that
+# Python code will also use.
 
-python2 generate.py mypaint-brush-settings-gen.h brushsettings-gen.h
-
-# The MyPaint code no longer needs the .json file at runtime, and it is
-# not installed as data.
+$PYTHON generate.py mypaint-brush-settings-gen.h brushsettings-gen.h
 
 $AUTOMAKE --add-missing || exit $?
 $AUTOCONF || exit $?
