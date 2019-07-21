@@ -1,32 +1,68 @@
 language: c
-
 compiler:
-  - gcc
-
+- gcc
 sudo: required
-
 dist: trusty
-
+osx_sdk: macosx10.12
+os:
+  - linux
+  - osx
 addons:
   apt:
     packages:
-      - libjson0-dev
-      - intltool
-      - libgirepository1.0-dev
-      - libgegl-dev
+    - libjson0-dev
+    - intltool
+    - libgirepository1.0-dev
+    - libgegl-dev
+
+before_install:
+  - |
+    if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then
+        brew install automake; 
+        brew install pkg-config; 
+        brew install libtool;
+        brew install intltool;
+        brew install glib;
+        brew install gettext;
+        brew install autoconf;
+        brew install p7zip;
+        brew link gettext --force
+
+        export ACLOCAL_FLAGS="-I/usr/local/opt/glib/share/aclocal/ -I/usr/local/opt/gettext/share/aclocal"
+    fi
+  - |
+    if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then 
+      sudo apt-get install -y p7zip-full; 
+    fi
 
 script:
-    - ./autogen.sh
-    - ./configure
-    - make
-    - make clean
-    - make distcheck
-    - make maintainer-clean
-    - ./autogen.sh
-    - ./configure --with-introspection
-    - make
-    - make maintainer-clean
-    - ./autogen.sh
-    - ./configure --with-gegl
-    - make
-    - make maintainer-clean
+- "./autogen.sh"
+- "./configure"
+- make
+env:
+  global:
+    secure: XXYLS56gC/wIQ6uY+DyEkDKSV8hKocWLjMFXw7zKMYrMn46Dfbauw4m2d04BwJE91fUZ9iJPUya8Hv6lfU/dqiTHG5Zn4hEg9dmqA9tQw9J3FLkYqBfbfzcYoANI5fxwS0UME+FF7OZBOaMvvtlw1PJuJqxW6gXbZ3WWBnf0NjXDs345d18KSqLBCeoiamp9ugX3Fut5OoUUu8PkfO8dmnZ3g1DL8v7oZ5mhrpXjFd5ykbSl2cK9xTT/XeW6oL1YXopcqBLaeoj7dj0YoeXripw3vik+/Sf+P6B1jtW7k+i5AsUvZ2mwlGvFBl2B3x+YpuEd5pN15J9xD7I64vWmXcuG9ZfT8c+vJuVoKYO6LiZugsU0JQ6aZBGZfPOr62gyjKKZyc1LcQPW6VQ+nijqMqkdtbz5Xh0D/RUVzYcnKjgb0Ht1E0O3BTEz6QBlrroA7oFjhnWhd9apQAJtQVCjzXFdXHRHnQEk+WAmaU927w+dKqWdklNtKGeTdnIbTRuLGyNdpDcpWD+7fx6/diNZExU7JSPiqbSdMN9FZlmT3BrbdrFwfrTVPjWyfxvYb/9S/iIHwF8lbf3pvVe3/mmhz4Wr/ZkwzVONiYzwif3anPx1wVLv5tMa4AIAJaer1aiAIHzBp7r1mTuFIr7ST0XmkR9DraKgfAu/IxDiUPmzfNk=
+
+after_success:
+  - cd ${TRAVIS_BUILD_DIR}/.libs/
+  - echo "looking for library files"
+  - ls *.a *.so* *.dylib*
+  - 7z a -r libmypaint-${TRAVIS_OS_NAME}.zip *.a* *.so* *.dylib*
+
+before_deploy:
+- export RELEASE_PKG_FILE=$(ls ${TRAVIS_BUILD_DIR}/.libs/*.zip)
+- echo "deploying $RELEASE_PKG_FILE to GitHub releases"
+- git config --local user.name "TRAVIS CI"
+- git config --local user.email "travis-ci@travis.org"
+- export TRAVIS_TAG="libmypaint-${TRAVIS_BRANCH}"
+- git tag $TRAVIS_TAG
+deploy:
+  provider: releases
+  api_key: "$GITHUB_TOKEN"
+  file_glob: true
+  file: "${RELEASE_PKG_FILE}"
+  skip_cleanup: true
+  overwrite: true
+  draft: true
+  on:
+    all_branches: true

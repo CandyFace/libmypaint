@@ -33,3 +33,4 @@ export PWD="$APPVEYOR_BULD_FOLDER"
 ./autogen.sh
 ./configure
 make distcheck
+make
