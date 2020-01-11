@@ -323,6 +323,7 @@ void render_dab_mask (uint16_t * mask,
                         float x, float y,
                         float radius,
                         float hardness,
+                        float softness,
                         float aspect_ratio, float angle
                         )
 {
@@ -337,7 +338,7 @@ void render_dab_mask (uint16_t * mask,
     // The hardness calculation is explained below:
     //
     // Dab opacity gradually fades out from the center (rr=0) to
-    // fringe (rr=1) of the dab. How exactly depends on the hardness.
+    // fringe (rr=1) of the dab. How exactly depends on the hardness and softness.
     // We use two linear segments, for which we pre-calculate slope
     // and offset here.
     //
@@ -349,10 +350,13 @@ void render_dab_mask (uint16_t * mask,
     // +-----------*> rr = (distance_from_center/radius)^2
     // 0           1
     //
-    float segment1_offset = 1.0f;
-    float segment1_slope  = -(1.0f/hardness - 1.0f);
-    float segment2_offset = hardness/(1.0f-hardness);
-    float segment2_slope  = -hardness/(1.0f-hardness);
+
+//    float softness = 0.5f;
+
+    float segment1_offset = (1.f)*(1.f-softness);
+    float segment1_slope  = -(1.0f/hardness - 1.0f)*(1.f-softness);
+    float segment2_offset = hardness/(1.0f-hardness)*(1.f-softness);
+    float segment2_slope  = -hardness/(1.0f-hardness)*(1.f-softness);
     // for hardness == 1.0, segment2 will never be used
 
     float angle_rad=angle/360*2*M_PI;
@@ -448,6 +452,7 @@ process_op(uint16_t *rgba_p, uint16_t *mask,
                     op->y - ty*MYPAINT_TILE_SIZE,
                     op->radius,
                     op->hardness,
+                    op->softness,
                     op->aspect_ratio, op->angle
                     );
 
@@ -556,7 +561,7 @@ update_dirty_bbox(MyPaintTiledSurface *self, OperationDataDrawDab *op)
 gboolean draw_dab_internal (MyPaintTiledSurface *self, float x, float y,
                float radius,
                float color_r, float color_g, float color_b,
-               float opaque, float hardness,
+               float opaque, float hardness, float softness,
                float color_a,
                float aspect_ratio, float angle,
                float lock_alpha,
@@ -577,6 +582,7 @@ gboolean draw_dab_internal (MyPaintTiledSurface *self, float x, float y,
     op->angle = angle;
     op->opaque = CLAMP(opaque, 0.0f, 1.0f);
     op->hardness = CLAMP(hardness, 0.0f, 1.0f);
+    op->softness = CLAMP(softness, 0.0f, 1.0f);
     op->lock_alpha = CLAMP(lock_alpha, 0.0f, 1.0f);
     op->colorize = CLAMP(colorize, 0.0f, 1.0f);
     op->posterize = CLAMP(posterize, 0.0f, 1.0f);
@@ -584,6 +590,7 @@ gboolean draw_dab_internal (MyPaintTiledSurface *self, float x, float y,
     op->paint = CLAMP(paint, 0.0f, 1.0f);
     if (op->radius < 0.1f) return FALSE; // don't bother with dabs smaller than 0.1 pixel
     if (op->hardness == 0.0f) return FALSE; // infintly small center point, fully transparent outside
+    if (op->softness == 1.0f) return FALSE; // infintly small center point, fully transparent outside
     if (op->opaque == 0.0f) return FALSE;
 
     color_r = CLAMP(color_r, 0.0f, 1.0f);
@@ -631,7 +638,7 @@ gboolean draw_dab_internal (MyPaintTiledSurface *self, float x, float y,
 int draw_dab (MyPaintSurface *surface, float x, float y,
                float radius,
                float color_r, float color_g, float color_b,
-               float opaque, float hardness,
+               float opaque, float hardness, float softness,
                float color_a,
                float aspect_ratio, float angle,
                float lock_alpha,
@@ -646,127 +653,13 @@ int draw_dab (MyPaintSurface *surface, float x, float y,
 
   // Normal pass
   if (draw_dab_internal(self, x, y, radius, color_r, color_g, color_b,
-                        opaque, hardness, color_a, aspect_ratio, angle,
-                        lock_alpha, colorize, posterize, posterize_num, paint)) {
+
       surface_modified = TRUE;
   }
 
   // Symmetry pass
   if(self->surface_do_symmetry) {
-    const float dist_x = (self->surface_center_x - x);
-    const float dist_y = (self->surface_center_y - y);
-    const float symm_x = self->surface_center_x + dist_x;
-    const float symm_y = self->surface_center_y + dist_y;
 
-    const float dab_dist = sqrt(dist_x * dist_x + dist_y * dist_y);
-    const float rot_width = 360.0 / ((float) self->rot_symmetry_lines);
-    const float dab_angle_offset = atan2(-dist_y, -dist_x) / (2 * M_PI) * 360.0;
-
-    int dab_count = 1;
-    int sub_dab_count = 0;
-
-      switch(self->symmetry_type) {
-          case MYPAINT_SYMMETRY_TYPE_VERTICAL:
-            if (draw_dab_internal(self, symm_x, y, radius, color_r, color_g, color_b,
-                                   opaque, hardness, color_a, aspect_ratio, -angle,
-                                   lock_alpha, colorize, posterize, posterize_num, paint)) {
-                surface_modified = TRUE;
-            }
-            break;
-
-          case MYPAINT_SYMMETRY_TYPE_HORIZONTAL:
-            if (draw_dab_internal(self, x, symm_y, radius, color_r, color_g, color_b,
-                                   opaque, hardness, color_a, aspect_ratio, angle + 180.0,
-                                   lock_alpha, colorize, posterize, posterize_num, paint)) {
-                surface_modified = TRUE;
-            }
-            break;
-
-          case MYPAINT_SYMMETRY_TYPE_VERTHORZ:
-            // reflect vertically
-            if (draw_dab_internal(self, symm_x, y, radius, color_r, color_g, color_b,
-                                   opaque, hardness, color_a, aspect_ratio, -angle,
-                                   lock_alpha, colorize, posterize, posterize_num, paint)) {
-                dab_count++;
-            }
-            // reflect horizontally
-            if (draw_dab_internal(self, x, symm_y, radius, color_r, color_g, color_b,
-                                   opaque, hardness, color_a, aspect_ratio, angle + 180.0,
-                                   lock_alpha, colorize, posterize, posterize_num, paint)) {
-                dab_count++;
-            }
-            // reflect horizontally and vertically
-            if (draw_dab_internal(self, symm_x, symm_y, radius, color_r, color_g, color_b,
-                                   opaque, hardness, color_a, aspect_ratio, -angle - 180.0,
-                                   lock_alpha, colorize, posterize, posterize_num, paint)) {
-                dab_count++;
-            }
-            if (dab_count == 4) {
-                surface_modified = TRUE;
-            }
-            break;
-          case MYPAINT_SYMMETRY_TYPE_SNOWFLAKE: {
-                gboolean failed_subdabs = FALSE;
-
-                // draw self->rot_symmetry_lines snowflake dabs
-                // because the snowflaked version of the initial dab
-                // was not done through carrying out the initial pass
-                for (sub_dab_count = 0; sub_dab_count < self->rot_symmetry_lines; sub_dab_count++) {
-                    // calculate the offset from rotational symmetry
-                    const float symmetry_angle_offset = ((float)sub_dab_count) * rot_width;
-
-                    // subtract the angle offset since we're progressing clockwise
-                    const float cur_angle = symmetry_angle_offset - dab_angle_offset;
-
-                    // progress through the rotation angle offsets clockwise
-                    // to reflect the dab relative to itself
-                    const float rot_x = self->surface_center_x - dab_dist*cos(cur_angle / 180.0 * M_PI);
-                    const float rot_y = self->surface_center_y - dab_dist*sin(cur_angle / 180.0 * M_PI);
-
-                    if (!draw_dab_internal(self, rot_x, rot_y, radius, color_r, color_g, color_b,
-                                           opaque, hardness, color_a,
-                                           aspect_ratio, -angle + symmetry_angle_offset,
-                                           lock_alpha, colorize, posterize, posterize_num, paint)) {
-                        failed_subdabs = TRUE;
-                        break;
-                    }
-                }
-
-                // do not bother falling to rotational if the snowflaked dabs failed
-                if (failed_subdabs) {
-                    break;
-                }
-                // if it succeeded, fallthrough to rotational to finish the process
-            }
-
-          case MYPAINT_SYMMETRY_TYPE_ROTATIONAL: {
-                // draw self-rot_symmetry_lines rotational dabs
-                // since initial pass handles the first dab
-                for (dab_count = 1; dab_count < self->rot_symmetry_lines; dab_count++)
-                {
-                    // calculate the offset from rotational symmetry
-                    const float symmetry_angle_offset = ((float)dab_count) * rot_width;
-
-                    // add the angle initial dab is from center point
-                    const float cur_angle = symmetry_angle_offset + dab_angle_offset;
-
-                    // progress through the rotation cangle offsets counterclockwise
-                    const float rot_x = self->surface_center_x + dab_dist*cos(cur_angle / 180.0 * M_PI);
-                    const float rot_y = self->surface_center_y + dab_dist*sin(cur_angle / 180.0 * M_PI);
-
-                    if (!draw_dab_internal(self, rot_x, rot_y, radius, color_r, color_g, color_b,
-                                           opaque, hardness, color_a, aspect_ratio,
-                                           angle + symmetry_angle_offset,
-                                           lock_alpha, colorize, posterize, posterize_num, paint)) {
-                        break;
-                    }
-                }
-                if (dab_count == self->rot_symmetry_lines) {
-                    surface_modified = TRUE;
-                }
-                break;
-            }
-      }
 
   }
 
@@ -784,6 +677,7 @@ void get_color (MyPaintSurface *surface, float x, float y,
 
     if (radius < 1.0f) radius = 1.0f;
     const float hardness = 0.5f;
+    const float softness = 0.5f;
     const float aspect_ratio = 1.0f;
     const float angle = 0.0f;
 
@@ -833,6 +727,7 @@ void get_color (MyPaintSurface *surface, float x, float y,
                         y - ty*MYPAINT_TILE_SIZE,
                         radius,
                         hardness,
+                        softness,
                         aspect_ratio, angle
                         );
 
