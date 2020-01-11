@@ -1,6 +1,6 @@
 # libmypaint - MyPaint brush engine library
 
-[![Translation Status](https://hosted.weblate.org/widgets/mypaint/libmypaint/svg-badge.svg)](https://hosted.weblate.org/engage/mypaint/?utm_source=widget)
+[![Translation status](https://hosted.weblate.org/widgets/mypaint/-/libmypaint/svg-badge.svg)](https://hosted.weblate.org/engage/mypaint/?utm_source=widget)
 [![Travis Build Status](https://travis-ci.org/mypaint/libmypaint.svg?branch=master)](https://travis-ci.org/mypaint/libmypaint)
 [![Appveyor Build Status](https://ci.appveyor.com/api/projects/status/github/mypaint/libmypaint?branch=master&svg=true)](https://ci.appveyor.com/project/jonnor/libmypaint)
 
@@ -35,7 +35,7 @@ to get started with a standard configuration:
 
 When building from git:
 
-    $ sudo apt install -y python2.7 autotools-dev intltool gettext libtool
+    $ sudo apt install -y python autotools-dev intltool gettext libtool
     
 You might also try using your package manager:
 

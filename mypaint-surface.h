@@ -18,8 +18,8 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <mypaint-config.h>
-#include <mypaint-rectangle.h>
+#include "mypaint-config.h"
+#include "mypaint-rectangle.h"
 
 G_BEGIN_DECLS
 
@@ -51,7 +51,7 @@ typedef void (*MyPaintSurfaceSavePngFunction) (MyPaintSurface *self, const char 
 
 typedef void (*MyPaintSurfaceBeginAtomicFunction) (MyPaintSurface *self);
 
-typedef void (*MyPaintSurfaceEndAtomicFunction) (MyPaintSurface *self, MyPaintRectangle *roi);
+typedef void (*MyPaintSurfaceEndAtomicFunction) (MyPaintSurface *self, MyPaintRectangles *roi);
 
 /**
   * MyPaintSurface:
@@ -107,7 +107,7 @@ mypaint_surface_save_png(MyPaintSurface *self, const char *path, int x, int y, i
 
 void mypaint_surface_begin_atomic(MyPaintSurface *self);
 
-void mypaint_surface_end_atomic(MyPaintSurface *self, MyPaintRectangle *roi);
+void mypaint_surface_end_atomic(MyPaintSurface *self, MyPaintRectangles *roi);
 
 void mypaint_surface_init(MyPaintSurface *self);
 void mypaint_surface_ref(MyPaintSurface *self);

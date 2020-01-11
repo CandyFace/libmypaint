@@ -18,8 +18,8 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <mypaint-config.h>
-#include <mypaint-glib-compat.h>
+#include "mypaint-config.h"
+#include "mypaint-glib-compat.h"
 
 G_BEGIN_DECLS
 
@@ -30,7 +30,13 @@ typedef struct {
     int height;
 } MyPaintRectangle;
 
+typedef struct {
+  int num_rectangles;
+  MyPaintRectangle* rectangles;
+} MyPaintRectangles;
+
 void mypaint_rectangle_expand_to_include_point(MyPaintRectangle *r, int x, int y);
+void mypaint_rectangle_expand_to_include_rect(MyPaintRectangle *r, MyPaintRectangle *other);
 MyPaintRectangle *
 mypaint_rectangle_copy(MyPaintRectangle *self);
 

@@ -14,11 +14,12 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <config.h>
+#include "config.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <assert.h>
 
 #ifdef _OPENMP
@@ -32,10 +33,6 @@
 #include "brushmodes.h"
 #include "operationqueue.h"
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 void process_tile(MyPaintTiledSurface *self, int tx, int ty);
 
 static void
@@ -45,9 +42,45 @@ begin_atomic_default(MyPaintSurface *surface)
 }
 
 static void
-end_atomic_default(MyPaintSurface *surface, MyPaintRectangle *roi)
+end_atomic_default(MyPaintSurface *surface, MyPaintRectangles *roi)
 {
     mypaint_tiled_surface_end_atomic((MyPaintTiledSurface *)surface, roi);
+}
+
+void
+prepare_bounding_boxes(MyPaintTiledSurface *self) {
+    MyPaintSymmetryState symm_state = self->symmetry_data.state_current;
+    const gboolean snowflake = symm_state.type == MYPAINT_SYMMETRY_TYPE_SNOWFLAKE;
+    const int num_bboxes_desired = symm_state.num_lines * (snowflake ? 2 : 1);
+    // If the bounding box array cannot fit one rectangle per symmetry dab,
+    // try to allocate enough space for that to be possible.
+    // Failure is ok, as the bounding box assignments will be functional anyway.
+    if (num_bboxes_desired > self->num_bboxes) {
+        const int margin = 10; // Add margin to avoid unnecessary reallocations.
+        const int num_to_allocate = num_bboxes_desired + margin;
+        int bytes_to_allocate = num_to_allocate * sizeof(MyPaintRectangle);
+        MyPaintRectangle* new_bboxes = malloc(bytes_to_allocate);
+        if (new_bboxes) {
+            if (self->num_bboxes > NUM_BBOXES_DEFAULT) {
+                // Free previous allocation
+                free(self->bboxes);
+            }
+            // Initialize memory
+            memset(new_bboxes, 0, bytes_to_allocate);
+            self->bboxes = new_bboxes;
+            self->num_bboxes = num_to_allocate;
+            // No need to clear anything after the memset, so reset counter
+            self->num_bboxes_dirtied = 0;
+        }
+    }
+    // Clean up any previously populated bounding boxes and reset the counter
+    for (int i = 0; i < MIN(self->num_bboxes, self->num_bboxes_dirtied); ++i) {
+        self->bboxes[i].height = 0;
+        self->bboxes[i].width = 0;
+        self->bboxes[i].x = 0;
+        self->bboxes[i].y = 0;
+    }
+    self->num_bboxes_dirtied = 0;
 }
 
 /**
@@ -61,10 +94,8 @@ end_atomic_default(MyPaintSurface *surface, MyPaintRectangle *roi)
 void
 mypaint_tiled_surface_begin_atomic(MyPaintTiledSurface *self)
 {
-    self->dirty_bbox.height = 0;
-    self->dirty_bbox.width = 0;
-    self->dirty_bbox.y = 0;
-    self->dirty_bbox.x = 0;
+    mypaint_update_symmetry_state(&self->symmetry_data);
+    prepare_bounding_boxes(self);
 }
 
 /**
@@ -76,7 +107,7 @@ mypaint_tiled_surface_begin_atomic(MyPaintTiledSurface *self)
  * Application code should only use mypaint_surface_end_atomic().
  */
 void
-mypaint_tiled_surface_end_atomic(MyPaintTiledSurface *self, MyPaintRectangle *roi)
+mypaint_tiled_surface_end_atomic(MyPaintTiledSurface *self, MyPaintRectangles *roi)
 {
     // Process tiles
     TileIndex *tiles;
@@ -90,7 +121,30 @@ mypaint_tiled_surface_end_atomic(MyPaintTiledSurface *self, MyPaintRectangle *ro
     operation_queue_clear_dirty_tiles(self->operation_queue);
 
     if (roi) {
-        *roi = self->dirty_bbox;
+        const int roi_rects = roi->num_rectangles;
+        const int num_dirty = self->num_bboxes_dirtied;
+        // Clear out the input rectangles that will be overwritten
+        for (int i = 0; i < MIN(roi_rects, num_dirty); ++i) {
+            roi->rectangles[i].x = 0;
+            roi->rectangles[i].y = 0;
+            roi->rectangles[i].width = 0;
+            roi->rectangles[i].height = 0;
+        }
+        // Write bounding box rectangles to the output array
+        const float bboxes_per_output = MAX(1, (float)num_dirty / roi_rects);
+        for (int i = 0; i < num_dirty; ++i) {
+            int out_index;
+            // If there is not enough space for all rectangles in the output,
+            // merge some of the rectangles with their list-adjacent neighbours.
+            if (num_dirty > roi_rects) {
+                out_index = (int)MIN(roi_rects - 1, roundf((float)i / bboxes_per_output));
+            } else {
+                out_index = i;
+            }
+            mypaint_rectangle_expand_to_include_rect(&(roi->rectangles[out_index]), &(self->bboxes[i]));
+        }
+        // Set the number of rectangles written to, so the caller knows which ones to act on.
+        roi->num_rectangles = MIN(roi_rects, num_dirty);
     }
 }
 
@@ -128,22 +182,22 @@ void mypaint_tiled_surface_tile_request_end(MyPaintTiledSurface *self, MyPaintTi
  * @active: TRUE to enable, FALSE to disable.
  * @center_x: X axis to mirror events across.
  * @center_y: Y axis to mirror events across.
+ * @symmetry_angle: Angle to rotate the symmetry lines
  * @symmetry_type: Symmetry type to activate.
  * @rot_symmetry_lines: Number of rotational symmetry lines.
  *
  * Enable/Disable symmetric brush painting across an X axis.
+ *
  */
 void
 mypaint_tiled_surface_set_symmetry_state(MyPaintTiledSurface *self, gboolean active,
                                          float center_x, float center_y,
+                                         float symmetry_angle,
                                          MyPaintSymmetryType symmetry_type,
                                          int rot_symmetry_lines)
 {
-    self->surface_do_symmetry = active;
-    self->surface_center_x = center_x;
-    self->surface_center_y = center_y;
-    self->symmetry_type = symmetry_type;
-    self->rot_symmetry_lines = MAX(2, rot_symmetry_lines);
+    mypaint_symmetry_set_pending( // Only write to the pending new state, nothing gets recalculated here
+        &self->symmetry_data, active, center_x, center_y, symmetry_angle, symmetry_type, rot_symmetry_lines);
 }
 
 /**
@@ -470,7 +524,7 @@ process_op(uint16_t *rgba_p, uint16_t *mask,
         }
       }
 
-      if (op->lock_alpha) {
+      if (op->lock_alpha && op->color_a != 0) {
         draw_dab_pixels_BlendMode_LockAlpha(mask, rgba_p,
                                             op->color_r, op->color_g, op->color_b,
                                             op->lock_alpha*op->opaque*(1 - op->colorize)*(1 - op->posterize)*(1 - op->paint)*(1<<15));
@@ -490,7 +544,7 @@ process_op(uint16_t *rgba_p, uint16_t *mask,
         }
       }
 
-      if (op->lock_alpha) {
+      if (op->lock_alpha && op->color_a != 0) {
         draw_dab_pixels_BlendMode_LockAlpha_Paint(mask, rgba_p,
                                             op->color_r, op->color_g, op->color_b,
                                             op->lock_alpha*op->opaque*(1 - op->colorize)*(1 - op->posterize)*op->paint*(1<<15));
@@ -541,10 +595,8 @@ process_tile(MyPaintTiledSurface *self, int tx, int ty)
     mypaint_tiled_surface_tile_request_end(self, &request_data);
 }
 
-// OPTIMIZE: send a list of the exact changed rects instead of a bounding box
-// to minimize the area being composited? Profile to see the effect first.
 void
-update_dirty_bbox(MyPaintTiledSurface *self, OperationDataDrawDab *op)
+update_dirty_bbox(MyPaintRectangle *bbox, OperationDataDrawDab *op)
 {
     int bb_x, bb_y, bb_w, bb_h;
     float r_fringe = op->radius + 1.0f; // +1.0 should not be required, only to be sure
@@ -553,8 +605,8 @@ update_dirty_bbox(MyPaintTiledSurface *self, OperationDataDrawDab *op)
     bb_w = floor (op->x + r_fringe) - bb_x + 1;
     bb_h = floor (op->y + r_fringe) - bb_y + 1;
 
-    mypaint_rectangle_expand_to_include_point(&self->dirty_bbox, bb_x, bb_y);
-    mypaint_rectangle_expand_to_include_point(&self->dirty_bbox, bb_x+bb_w-1, bb_y+bb_h-1);
+    mypaint_rectangle_expand_to_include_point(bbox, bb_x, bb_y);
+    mypaint_rectangle_expand_to_include_point(bbox, bb_x+bb_w-1, bb_y+bb_h-1);
 }
 
 // returns TRUE if the surface was modified
@@ -568,7 +620,8 @@ gboolean draw_dab_internal (MyPaintTiledSurface *self, float x, float y,
                float colorize,
                float posterize,
                float posterize_num,
-               float paint
+               float paint,
+               int bbox_index
                )
 
 {
@@ -629,10 +682,11 @@ gboolean draw_dab_internal (MyPaintTiledSurface *self, float x, float y,
         }
     }
 
-    update_dirty_bbox(self, op);
+    update_dirty_bbox(&self->bboxes[bbox_index], op);
 
     return TRUE;
 }
+
 
 // returns TRUE if the surface was modified
 int draw_dab (MyPaintSurface *surface, float x, float y,
@@ -647,23 +701,104 @@ int draw_dab (MyPaintSurface *surface, float x, float y,
                float posterize_num,
                float paint)
 {
-  MyPaintTiledSurface *self = (MyPaintTiledSurface *)surface;
+    MyPaintTiledSurface* self = (MyPaintTiledSurface*)surface;
 
-  gboolean surface_modified = FALSE;
+    // These calls are repeated enough to warrant a local macro, for both readability and correctness.
+#define DDI(x, y, angle, bb_idx) (draw_dab_internal(\
+        self, (x), (y), radius, color_r, color_g, color_b, opaque, \
+        hardness, softness, color_a, aspect_ratio, (angle), \
+        lock_alpha, colorize, posterize, posterize_num, paint, (bb_idx)))
 
-  // Normal pass
-  if (draw_dab_internal(self, x, y, radius, color_r, color_g, color_b,
+    // Normal pass
+    gboolean surface_modified = DDI(x, y, angle, 0);
 
-      surface_modified = TRUE;
-  }
+    int num_bboxes_used = surface_modified ? 1 : 0;
 
-  // Symmetry pass
-  if(self->surface_do_symmetry) {
+    // Symmetry pass
 
+    // OPTIMIZATION: skip the symmetry pass if surface was not modified by the initial dab;
+    // at current if the initial dab does not modify the surface, none of the symmetry dabs
+    // will either. If/when selection masks are added, this optimization _must_ be removed,
+    // and `surface_modified` must be or'ed with the result of each call to draw_dab_internal.
+    MyPaintSymmetryData *symm_data = &self->symmetry_data;
+    if (surface_modified && symm_data->active && symm_data->num_symmetry_matrices) {
+        const MyPaintSymmetryState symm = symm_data->state_current;
+        const int num_bboxes = self->num_bboxes;
+        const float rot_angle = 360.0 / symm.num_lines;
+        const MyPaintTransform* const matrices = symm_data->symmetry_matrices;
+        float x_out, y_out;
 
-  }
+        switch (symm.type) {
+        case MYPAINT_SYMMETRY_TYPE_VERTICAL: {
+            mypaint_transform_point(&matrices[0], x, y, &x_out, &y_out);
+            DDI(x_out, y_out, -2.0 * (90 + symm.angle) - angle, 1);
+            num_bboxes_used = 2;
+            break;
+        }
+        case MYPAINT_SYMMETRY_TYPE_HORIZONTAL: {
+            mypaint_transform_point(&matrices[0], x, y, &x_out, &y_out);
+            DDI(x_out, y_out, -2.0 * symm.angle - angle, 1);
+            num_bboxes_used = 2;
+            break;
+        }
+        case MYPAINT_SYMMETRY_TYPE_VERTHORZ: {
+            // Reflect across horizontal line
+            mypaint_transform_point(&matrices[0], x, y, &x_out, &y_out);
+            DDI(x_out, y_out, -2.0 * symm.angle - angle, 1);
+            // Then across the vertical line (diagonal)
+            mypaint_transform_point(&matrices[1], x, y, &x_out, &y_out);
+            DDI(x_out, y_out, angle, 2);
+            // Then back across the horizontal line
+            mypaint_transform_point(&matrices[2], x, y, &x_out, &y_out);
+            DDI(x_out, y_out, -2.0 * symm.angle - angle, 3);
+            num_bboxes_used = 4;
+            break;
+        }
+        case MYPAINT_SYMMETRY_TYPE_SNOWFLAKE: {
 
-  return surface_modified;
+            // These dabs will occupy the bboxes after the last bbox used by the rotational dabs.
+            const int offset = MIN(num_bboxes / 2, symm.num_lines);
+            const float dabs_per_bbox = MAX(1, (float)symm.num_lines * 2.0 / num_bboxes);
+            const int base_idx = symm.num_lines - 1;
+            const float base_angle = -2 * symm.angle - angle;
+            // draw snowflake dabs for _all_ symmetry lines as we need to reflect the initial dab.
+            for (int dab_count = 0; dab_count < symm.num_lines; dab_count++) {
+                // If the number of bboxes cannot fit all snowflake dabs, use half for the rotational dabs
+                // and the other half for the reflected dabs. This is not always optimal, but seldom bad.
+                const int bbox_idx = offset + MIN(roundf(dab_count / dabs_per_bbox), num_bboxes - 1);
+                mypaint_transform_point(&matrices[base_idx + dab_count], x, y, &x_out, &y_out);
+                DDI(x_out, y_out, base_angle - dab_count * rot_angle, bbox_idx);
+            }
+            num_bboxes_used = MIN(self->num_bboxes, symm.num_lines * 2);
+            // fall through to rotational to finish the process
+        }
+        case MYPAINT_SYMMETRY_TYPE_ROTATIONAL: {
+
+            // Set the dab bbox distribution factor based on whether the pass is only
+            // rotational, or following a snowflake pass. For the latter, we compress
+            // the available range (unimportant if there are enough bboxes to go around).
+            const gboolean snowflake = symm.type == MYPAINT_SYMMETRY_TYPE_SNOWFLAKE;
+            float dabs_per_bbox = MAX(1, (float)(symm.num_lines * (snowflake ? 2 : 1)) / num_bboxes);
+
+            // draw self->rot_symmetry_lines - 1 rotational dabs since initial pass handles the first dab
+            for (int dab_count = 1; dab_count < symm.num_lines; dab_count++) {
+                const int bbox_index = MIN(roundf(dab_count / dabs_per_bbox), num_bboxes - 1);
+                mypaint_transform_point(&matrices[dab_count - 1], x, y, &x_out, &y_out);
+                DDI(x_out, y_out, angle - dab_count * rot_angle, bbox_index);
+            }
+
+            // Use existing (larger) number of bboxes if it was set (in a snowflake pass)
+            num_bboxes_used = MIN(self->num_bboxes, MAX(symm.num_lines, num_bboxes_used));
+            break;
+        }
+        default:
+            fprintf(stderr, "Warning: Unhandled symmetry type: %d\n", symm.type);
+            break;
+        }
+    }
+    self->num_bboxes_dirtied = MIN(self->num_bboxes, num_bboxes_used);
+    return surface_modified;
+#undef DDI
 }
 
 
@@ -701,6 +836,27 @@ void get_color (MyPaintSurface *surface, float x, float y,
     int tiles_n = (tx2 - tx1) * (ty2 - ty1);
     #endif
 
+    // Calculate the `guaranteed sample` interval and
+    // the percentage of pixels to sample for the dab.
+    // The basic idea is to have larger intervals and
+    // lower percentages for really large dabs, to
+    // avoid accumulated rounding errors and heavier
+    // calculations.
+    //
+    // The values are set so that the number of pixels
+    // sampled is _bounded_ linearly by the radius.
+    //
+    // The constant factor 7 is chosen through manual
+    // evaluation of results and gives us a total sample
+    // rate bounded by '1/(r * 3.5)'
+    // Other models may have better properties, some
+    // more thinking needed here.
+    //
+    // For really small radii we'll sample every pixel
+    // in the dab to avoid biasing.
+    const int sample_interval = radius <= 2.0f ? 1 : (int)(radius * 7);
+    const float random_sample_rate = 1.0f / (7 * radius);
+
     #pragma omp parallel for schedule(static) if(self->threadsafe_tile_requests && tiles_n > 3)
     for (int ty = ty1; ty <= ty2; ty++) {
       for (int tx = tx1; tx <= tx2; tx++) {
@@ -734,8 +890,9 @@ void get_color (MyPaintSurface *surface, float x, float y,
         // TODO: try atomic operations instead
         #pragma omp critical
         {
-        get_color_pixels_accumulate (mask, rgba_p,
-                                     &sum_weight, &sum_r, &sum_g, &sum_b, &sum_a, paint);
+        get_color_pixels_accumulate (
+          mask, rgba_p, &sum_weight, &sum_r, &sum_g, &sum_b, &sum_a, paint,
+          sample_interval, random_sample_rate);
         }
 
         mypaint_tiled_surface_tile_request_end(self, &request_data);
@@ -744,12 +901,23 @@ void get_color (MyPaintSurface *surface, float x, float y,
 
     assert(sum_weight > 0.0f);
     sum_a /= sum_weight;
-    *color_a = sum_a;
-    // now un-premultiply the alpha
+
+    // For legacy sampling, we need to divide
+    // by the total after the accumulation.
+    if (paint < 0.0) {
+        sum_r /= sum_weight;
+        sum_g /= sum_weight;
+        sum_b /= sum_weight;
+    }
+
+    *color_a = CLAMP(sum_a, 0.0f, 1.0f);
     if (sum_a > 0.0f) {
-      *color_r = sum_r;
-      *color_g = sum_g;
-      *color_b = sum_b;
+      // Straighten the color channels if using legacy sampling.
+      // Clamp to guard against rounding errors.
+      const float demul = paint < 0.0 ? sum_a : 1.0;
+      *color_r = CLAMP(sum_r / demul, 0.0f, 1.0f);
+      *color_g = CLAMP(sum_g / demul, 0.0f, 1.0f);
+      *color_b = CLAMP(sum_b / demul, 0.0f, 1.0f);
     } else {
       // it is all transparent, so don't care about the colors
       // (let's make them ugly so bugs will be visible)
@@ -757,14 +925,7 @@ void get_color (MyPaintSurface *surface, float x, float y,
       *color_g = 1.0f;
       *color_b = 0.0f;
     }
-
-    // fix rounding problems that do happen due to floating point math
-    *color_r = CLAMP(*color_r, 0.0f, 1.0f);
-    *color_g = CLAMP(*color_g, 0.0f, 1.0f);
-    *color_b = CLAMP(*color_b, 0.0f, 1.0f);
-    *color_a = CLAMP(*color_a, 0.0f, 1.0f);
 }
-
 
 /**
  * mypaint_tiled_surface_init: (skip)
@@ -789,15 +950,11 @@ mypaint_tiled_surface_init(MyPaintTiledSurface *self,
     self->tile_size = MYPAINT_TILE_SIZE;
     self->threadsafe_tile_requests = FALSE;
 
-    self->dirty_bbox.x = 0;
-    self->dirty_bbox.y = 0;
-    self->dirty_bbox.width = 0;
-    self->dirty_bbox.height = 0;
-    self->surface_do_symmetry = FALSE;
-    self->symmetry_type = MYPAINT_SYMMETRY_TYPE_VERTICAL;
-    self->surface_center_x = 0.0f;
-    self->surface_center_y = 0.0f;
-    self->rot_symmetry_lines = 2;
+    self->num_bboxes = NUM_BBOXES_DEFAULT;
+    self->bboxes = self->default_bboxes;
+    memset(self->bboxes, 0, sizeof(MyPaintRectangle) * NUM_BBOXES_DEFAULT);
+
+    self->symmetry_data = mypaint_default_symmetry_data();
     self->operation_queue = operation_queue_new();
 }
 
@@ -812,4 +969,8 @@ void
 mypaint_tiled_surface_destroy(MyPaintTiledSurface *self)
 {
     operation_queue_free(self->operation_queue);
+    if (self->bboxes != self->default_bboxes) {
+      free(self->bboxes);
+    }
+    mypaint_symmetry_data_destroy(&self->symmetry_data);
 }
